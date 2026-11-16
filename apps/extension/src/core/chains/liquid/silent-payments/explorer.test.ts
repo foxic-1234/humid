@@ -288,13 +288,14 @@ describe("a fallback explorer that failed", () => {
 		expect(probes).toBe(0);
 		expect(pickExplorerApi(apis)).toBe(primary);
 		expect(fallbackExplorerUnreachable(apis)).toBe(false);
-		// Still where older blocks are read from: its requests wait the pause out.
-		expect(uncappedExplorerApi(apis)).toBe(fallback);
+		// Older blocks are not read from it meanwhile: going on through a 429 is what gets an IP
+		// shut out for an hour. The time left still counts on it: it is back in minutes.
+		expect(uncappedExplorerApi(apis)).not.toBe(fallback);
 		expect(sustainedExplorerRequestRate(apis)).toBeGreaterThan(1);
 
-		// The pause over, it is used again: a fallback has no hour to wait out.
-		later(MINUTE);
+		later(5 * MINUTE);
 		expect(pickExplorerApi(apis)).toBe(fallback);
+		expect(uncappedExplorerApi(apis)).toBe(fallback);
 	});
 
 	it("does not take a page that is not the chain tip for an answer", async () => {

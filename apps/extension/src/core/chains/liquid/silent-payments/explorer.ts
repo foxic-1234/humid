@@ -96,13 +96,13 @@ export const MAX_EXPLORER_REQUESTS_PER_SECOND = 20;
 const RATE_STEP_UP_MS = 10_000;
 /**
  * Servers used when the primary one fails or its hour of requests is spent, which is where most of
- * a long scan is read from. A probe from one IP found liquid.network clean at 15 requests a second
- * for a minute (and at 8 for three) and answering 429 within seconds at 20, with no ban after it;
- * the ceiling leaves room for other wallets behind the same IP and for limits over longer windows,
- * which the probe did not reach.
+ * a long scan is read from. liquid.network answers 15 requests a second cleanly for a minute, but
+ * what it limits is a longer window: two scans at 6 to 7 a second each ended after some 1,400
+ * requests (four minutes) in a few 429s, then timeouts, then no answer to that IP for over an
+ * hour. The rate it keeps up for hours is not measured yet; the ceiling stays low until it is.
  */
 const FALLBACK_EXPLORER_ORIGINS = new Set(["https://liquid.network"]);
-export const FALLBACK_EXPLORER_REQUESTS_PER_SECOND = 10;
+export const FALLBACK_EXPLORER_REQUESTS_PER_SECOND = 1;
 
 /**
  * Requests an hour the scanner allows itself on a server that caps them per IP. Without an API key
@@ -400,12 +400,17 @@ export function explorerHistoryAllowance(api: string): number {
 }
 
 /**
- * The first of `apis` on a server without an hourly budget that answers, which is where a search
- * of older blocks reads from. One pausing after a 429 counts: its requests wait the pause out.
+ * The first of `apis` on a server without an hourly budget that is not being passed over, which
+ * is where a search of older blocks reads from. One that answered 429 is left alone for its
+ * minutes: liquid.network stopped answering an IP for over an hour after a scan that went on
+ * through its 429s.
  */
 export function uncappedExplorerApi(apis: string[]): string | undefined {
 	const now = Date.now();
-	return apis.find((api) => limiterFor(api).budget === undefined && !awaitsProbe(api, now));
+	return apis.find((api) => {
+		const limiter = limiterFor(api);
+		return limiter.budget === undefined && limiter.avoidUntil <= now;
+	});
 }
 
 /** Requests started since the service worker began, on every explorer. */
@@ -604,13 +609,7 @@ export async function fetchFromExplorer(
 					: Math.min(1000 * 2 ** (limiter.consecutiveRateLimits - 1), MAX_RATE_LIMIT_COOLDOWN_MS)) +
 				jitter();
 			limiter.cooldownUntil = Math.max(limiter.cooldownUntil, Date.now() + pause);
-			// A fallback has no hourly cap behind its 429: it is back once the pause is over, and
-			// passing it over for minutes would leave a long scan to the capped server.
-			limiter.avoidUntil =
-				Date.now() +
-				(FALLBACK_EXPLORER_ORIGINS.has(limiter.origin)
-					? pause
-					: Math.max(pause, RATE_LIMITED_AVOID_MS));
+			limiter.avoidUntil = Date.now() + Math.max(pause, RATE_LIMITED_AVOID_MS);
 			// It answers: this pause is the server's own, which no probe lifts.
 			limiter.probeAfter = 0;
 			persistLimiter(limiter);
