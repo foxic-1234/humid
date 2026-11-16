@@ -73,6 +73,16 @@ export function LiquidTxDetailSheet({
 							<DetailRow label="Direction">
 								<span className="capitalize">{active.direction}</span>
 							</DetailRow>
+							{active.isSilentPayment ? (
+								<DetailRow label="Payment type">
+									<span className="text-primary font-medium">Silent Payment (ELIP-352)</span>
+								</DetailRow>
+							) : null}
+							{active.silentPaymentLabel ? (
+								<DetailRow label="Label">
+									<span className="font-medium break-all">{active.silentPaymentLabel}</span>
+								</DetailRow>
+							) : null}
 							<DetailRow label="Date">{active.date}</DetailRow>
 							<DetailRow label="Network fee">
 								{active.fee === null ? "—" : `${formatUnits(active.fee, L_BTC_DECIMALS)} L-BTC`}

@@ -103,6 +103,16 @@ function resolveLiquidNetworkKind(
 	return persisted ?? LIQUID_NETWORK_KINDS.REGTEST;
 }
 
+/**
+ * Whether a chain is Liquid mainnet, by the network it is set to and not by its id: a chain the
+ * user adds for mainnet (their own Esplora server, say) has an id of its own. Everything that
+ * depends on the network asks this: ELIP-352 key paths and address prefixes, and the network a
+ * recipient's address must belong to.
+ */
+export function isLiquidMainnetChain(chain: { settings: { network: LiquidNetworkKind } }): boolean {
+	return chain.settings.network === LIQUID_NETWORK_KINDS.MAINNET;
+}
+
 export function parseLiquidChainRecord(value: unknown): LiquidChainRecord {
 	const parsed = liquidChainRecordSchema.safeParse(value);
 

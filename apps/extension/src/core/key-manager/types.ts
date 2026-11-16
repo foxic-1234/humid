@@ -32,4 +32,6 @@ export type CreateLocalRootKeyManagerStateInput = {
 	name?: string;
 	seedMaterial: string;
 	source?: "generated" | "imported";
+	/** For a restored wallet: when the user says it was created (ms since epoch). */
+	walletCreatedAt?: number;
 };

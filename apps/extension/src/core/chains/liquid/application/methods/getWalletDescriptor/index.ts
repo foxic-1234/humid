@@ -18,7 +18,7 @@ import {
 	parseLiquidGetWalletDescriptorParams,
 } from "../../../domain/validation";
 import type { LiquidWalletAccount, LiquidWalletBackend } from "../../backends/LiquidWalletBackend";
-import { resolveDappAccount } from "../../dappAccountScope";
+import { resolveDappAccount, wipeReviewedAccount } from "../../dappAccountScope";
 
 export type LiquidGetWalletDescriptorContext = WalletRpcBaseContext & {
 	chain: LiquidChainRecord;
@@ -47,6 +47,7 @@ export const getLiquidWalletDescriptor = createWalletMethod<
 		message: "A dapp wants to read the public Liquid wallet descriptor for this account.",
 		title: "Share Liquid descriptor?",
 	}),
+	dispose: wipeReviewedAccount,
 	execute: async ({ context, params, review }) => ({
 		accountIdentifier: review.account.accountIdentifier,
 		chainId: review.account.chainId,

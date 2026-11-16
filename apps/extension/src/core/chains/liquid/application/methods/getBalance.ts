@@ -11,7 +11,7 @@ import {
 } from "../../domain/LiquidRpc";
 import { parseLiquidAssetId, parseLiquidGetBalanceParams } from "../../domain/validation";
 import type { LiquidWalletAccount, LiquidWalletBackend } from "../backends/LiquidWalletBackend";
-import { resolveDappAccount } from "../dappAccountScope";
+import { resolveDappAccount, wipeReviewedAccount } from "../dappAccountScope";
 import type { ReadPortfolioSnapshot } from "../LiquidRpcContext";
 
 export type LiquidGetBalanceContext = WalletRpcBaseContext & {
@@ -43,6 +43,7 @@ export const getLiquidBalance = createWalletMethod<
 		message: "A dapp wants to read the Liquid balance for this account.",
 		title: "Share Liquid balance?",
 	}),
+	dispose: wipeReviewedAccount,
 	execute: async ({ context, review }) => {
 		const { account, requestedAsset } = review;
 
@@ -79,10 +80,16 @@ export const getLiquidBalance = createWalletMethod<
 	review: async ({ context, params }) => {
 		const account = await resolveDappAccount(context);
 
-		return {
-			account,
-			requestedAsset: resolveRequestedAsset(params.assetId, account),
-		};
+		try {
+			return {
+				account,
+				requestedAsset: resolveRequestedAsset(params.assetId, account),
+			};
+		} catch (error) {
+			// No review comes back, so nothing would dispose of the account.
+			wipeReviewedAccount({ account });
+			throw error;
+		}
 	},
 });
 

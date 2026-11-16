@@ -13,7 +13,7 @@ import {
 } from "../../../domain/message/types";
 import { parseLiquidSignMessageParams } from "../../../domain/message/validation";
 import type { LiquidWalletAccount, LiquidWalletBackend } from "../../backends/LiquidWalletBackend";
-import { resolveDappAccount } from "../../dappAccountScope";
+import { resolveDappAccount, wipeReviewedAccount } from "../../dappAccountScope";
 
 export type LiquidSignMessageContext = WalletRpcBaseContext & {
 	chain: LiquidChainRecord;
@@ -51,15 +51,21 @@ export const signLiquidMessage = createWalletMethod<
 		].join("\n\n"),
 		title: "Sign Liquid message?",
 	}),
+	dispose: wipeReviewedAccount,
 	execute: ({ context, params, review }) =>
 		context.walletBackend.signMessage(review.account, params),
 	id: LIQUID_WALLET_RPC_METHODS.SIGN_MESSAGE,
 	parse: parseSignMessageParams,
 	review: async ({ context, params }) => {
 		const account = await resolveDappAccount(context);
-
-		const message = await context.walletBackend.inspectMessageSigning(account, params);
-		return { account, message };
+		try {
+			const message = await context.walletBackend.inspectMessageSigning(account, params);
+			return { account, message };
+		} catch (error) {
+			// No review comes back, so nothing would dispose of the account.
+			wipeReviewedAccount({ account });
+			throw error;
+		}
 	},
 });
 

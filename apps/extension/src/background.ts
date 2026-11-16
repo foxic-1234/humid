@@ -1,3 +1,4 @@
+import { zeroizeRecipientKeys } from "@humid/sp-core";
 import browser from "webextension-polyfill";
 
 import { createAccountRegistry } from "@/core/accounts/application/account-registry";
@@ -43,6 +44,7 @@ import {
 import { createInjectedRpcHandlers } from "@/core/extension-background/injected-rpc";
 import {
 	createInternalRpcHandlers,
+	type SilentPaymentLabelsDeps,
 	syncWalletVaultAuthStore,
 } from "@/core/extension-background/internal-rpc";
 import { createPortfolioSyncEngine } from "@/core/extension-background/portfolio-sync/createPortfolioSyncEngine";
@@ -257,6 +259,67 @@ const init = async () => {
 			input,
 		);
 
+	const getSilentPaymentScanStatus = async (
+		input?: import("@/core/accounts/application/accounts-rpc/model/types").GetSilentPaymentScanStatusInput,
+	): Promise<
+		import("@/core/accounts/application/accounts-rpc/model/types").SilentPaymentScanStatusResult
+	> => {
+		const selected = await resolveSelectedLiquidAccount();
+		return (
+			liquidChainGroup.accountRuntime.getSilentPaymentScanStatus?.(selected.input, input) ?? {
+				chainId: input?.chainId ?? selected.input.chain.id,
+				currentHeight: 0,
+				isScanning: false,
+				percentage: 100,
+				state: "idle",
+				tipHeight: 0,
+				totalBlocksToScan: 0,
+			}
+		);
+	};
+
+	const rescanSilentPayments = async (
+		input: import("@/core/accounts/application/accounts-rpc/model/types").RescanSilentPaymentsInput,
+	): Promise<void> => {
+		const selected = await resolveSelectedLiquidAccount();
+		await liquidChainGroup.accountRuntime.rescanSilentPayments?.(selected.input, input);
+
+		void portfolioSync.refresh().catch((err) => {
+			console.warn("[liquid-sync] refresh after rescan failed:", err);
+		});
+	};
+
+	// The selected account on `chainId` (default: the selected chain). Labels belong to one network,
+	// and the chain settings page can edit a network other than the selected one.
+	const resolveSelectedLiquidAccountOn = async (chainId?: string) => {
+		const selected = await resolveSelectedLiquidAccount();
+		if (!chainId || chainId === selected.chainId) return selected;
+
+		const chain = await resolveUnlockedLiquidChain(parseLiquidChainId(chainId));
+		return { ...selected, chainId: chain.id, input: { ...selected.input, chain } };
+	};
+
+	const unsupportedLabels = () => {
+		throw new Error("Silent Payment labels are not supported in this runtime");
+	};
+
+	const silentPaymentLabels: SilentPaymentLabelsDeps = {
+		create: async (input) =>
+			(liquidChainGroup.accountRuntime.createSilentPaymentLabel ?? unsupportedLabels)(
+				(await resolveSelectedLiquidAccountOn(input.chainId)).input,
+				input,
+			),
+		list: async (input) =>
+			(liquidChainGroup.accountRuntime.listSilentPaymentLabels ?? unsupportedLabels)(
+				(await resolveSelectedLiquidAccountOn(input?.chainId)).input,
+			),
+		rename: async (input) =>
+			(liquidChainGroup.accountRuntime.renameSilentPaymentLabel ?? unsupportedLabels)(
+				(await resolveSelectedLiquidAccountOn(input.chainId)).input,
+				input,
+			),
+	};
+
 	const estimateMaxSend = async (input: EstimateMaxSendInput): Promise<EstimateMaxSendResult> =>
 		liquidChainGroup.accountRuntime.estimateMaxSend(
 			(await resolveSelectedLiquidAccount()).input,
@@ -271,9 +334,17 @@ const init = async () => {
 			key,
 			scan: async () => {
 				const target = await liquidChainGroup.accountRuntime.resolveScanTarget(input);
-				void scanTargetStore.save(key, target);
+				void scanTargetStore.save(key, {
+					chain: target.chain,
+					descriptor: target.descriptor,
+					silentPaymentAddress: target.silentPaymentAddress,
+				});
 
-				return liquidChainGroup.accountRuntime.scanPortfolio(target);
+				try {
+					return await liquidChainGroup.accountRuntime.scanPortfolio(target);
+				} finally {
+					zeroizeRecipientKeys(target.silentPaymentKeys);
+				}
 			},
 		};
 	}, snapshotStore);
@@ -294,12 +365,31 @@ const init = async () => {
 		backgroundRefreshInFlight = true;
 
 		try {
-			const portfolio = await liquidChainGroup.accountRuntime.scanPortfolio(active.target);
+			// The locked vault hides the SP store: the scan keeps the SP outputs of the saved snapshot.
+			const portfolio = await liquidChainGroup.accountRuntime.scanPortfolio(
+				active.target,
+				persisted?.data,
+			);
 
 			await snapshotStore.save(active.key, { data: portfolio, syncedAt: Date.now() });
 		} finally {
 			backgroundRefreshInFlight = false;
 		}
+	};
+
+	// Unlocked, the alarm runs a full sync instead: only it has the account's keys, which the
+	// Silent Payments scan needs. Same freshness and in-flight rules as above.
+	const unlockedRefresh = async (): Promise<void> => {
+		const { accountGroupId, chainId } = await resolveSelectedLiquidAccount();
+		const key = `${accountGroupId}::${chainId}`;
+
+		if (portfolioSync.isSyncing(key)) return;
+
+		const persisted = await snapshotStore.load(key);
+
+		if (persisted && Date.now() - persisted.syncedAt < BACKGROUND_REFRESH_MIN_INTERVAL_MS) return;
+
+		await portfolioSync.refresh();
 	};
 
 	const getPortfolio = (): Promise<PortfolioSnapshot> => portfolioSync.getSnapshot();
@@ -516,7 +606,16 @@ const init = async () => {
 				purgeAccountWalletConnectSessions,
 				refreshPortfolio,
 				sendTransfer,
+				getSilentPaymentScanStatus,
+				onWalletUnlocked: () => {
+					void refreshPortfolio().catch((err) => {
+						console.warn("[liquid-sync] onWalletUnlocked refresh failed", err);
+					});
+				},
+				rescanSilentPayments,
+				silentPaymentLabels,
 			}),
+
 			...createDappConnectInternalHandlers({ getAccountModel, registry: accountRegistry }),
 			...createDappSessionsInternalHandlers({
 				disconnectWalletConnect,
@@ -538,7 +637,7 @@ const init = async () => {
 		});
 	}
 
-	return { backgroundRefresh };
+	return { backgroundRefresh, unlockedRefresh };
 };
 
 let initialization: ReturnType<typeof init> | null = null;
@@ -548,13 +647,13 @@ browser.alarms.onAlarm.addListener(async (alarm) => {
 	if (alarm.name !== PORTFOLIO_REFRESH_ALARM) return;
 
 	try {
-		const { backgroundRefresh } = await ensureInitialized();
+		const { backgroundRefresh, unlockedRefresh } = await ensureInitialized();
 
 		const locked = await walletVaultBackground.enforceAutoLock();
 
 		if (locked) emitWalletEvent("accountsChanged");
 
-		await backgroundRefresh();
+		await (locked ? backgroundRefresh() : unlockedRefresh());
 	} catch (error) {
 		console.error("[liquid-sync] background refresh failed", error);
 	}

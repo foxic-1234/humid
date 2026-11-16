@@ -14,6 +14,9 @@ export type PortfolioViewActivity = {
 	direction: string;
 	fee: bigint | null;
 	id: string;
+	isSilentPayment?: boolean;
+	/** Name of the user's label (m >= 1) a Silent Payment was received on. */
+	silentPaymentLabel?: string;
 	status: "pending" | "confirmed";
 	timestamp: number | null;
 };

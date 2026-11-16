@@ -1,0 +1,33 @@
+# Wallet scanner: what it trusts the explorer with
+
+The extension finds its Silent Payments itself (`apps/extension/src/core/chains/liquid/silent-payments/localScanner.ts`). It reads blocks from a public Esplora server, by default Blockstream's and, as a fallback, liquid.network. Blockstream caps requests per IP by the hour, so the scanner allows itself a few hundred an hour there and reads the rest of a long scan from the fallback: over a long history most blocks come from liquid.network. Its keys never leave the device and every transaction is signed locally. An explorer cannot steal funds. It can still mislead the wallet about what it holds, and it learns something about the wallet from the requests it serves.
+
+## What the wallet checks
+
+- **The chain of headers.** Each block header must name the previous block's hash, within a window of blocks and across runs: the cursor's block is looked up again before a run continues from it, and a backfill checks that each window ends at the block the one above it names.
+- **The raw block against its header.** A raw block is accepted only if its hash and height are the header's, and its transactions hash to the header's merkle root. A transaction taken from a raw block is therefore committed to by the block hash.
+- **The listing against the block.** The JSON listing must hold exactly the header's `tx_count` transactions and as many as the raw block. Each 25-transaction page must hold exactly its share.
+- **Mempool transactions.** For a transaction with a Taproot output, the raw transaction's computed txid must be the one the mempool listing named. A transaction without one cannot pay the wallet, so its raw bytes are not fetched: a spend of the wallet's output it shows is taken from its JSON listing. Such a spend stays unconfirmed, and once the wallet has scanned every block, it counts as unspent again if no block confirmed it within two hours.
+- **Rangeproofs.** The merkle root commits to txids, not to witnesses, where the rangeproofs lie. If an output matches but does not unblind, the wallet tries a second explorer's copy of the block before recording the output as not unblinded. An output unblinded once keeps its amount and asset: a later copy of its transaction that does not unblind (on a rescan, say) changes nothing.
+
+## What it does not check
+
+| The explorer could…                                         | Because                                                                                            | Effect                                                                                                                                                                                                                                 |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Serve blocks the federation never signed                    | The block signature (signblock witness) is parsed but not verified against the federation's script | A payment to the wallet's public SP address that never happened can look confirmed. The wallet shows money it does not have; spending it fails at broadcast.                                                                           |
+| Serve another chain                                         | Headers are only checked to link to each other                                                     | Same as above, or a real payment is hidden from the wallet.                                                                                                                                                                            |
+| Lie about the outputs a transaction spends (prevouts)       | Prevout scripts come from the JSON listing, which no block commits to                              | Input eligibility and the input key sum come out wrong, so the shared secret is wrong and a real payment is missed. A fake payment needs no lie: anyone can pay a public SP address.                                                   |
+| Lie about whether an output is spent, where the wallet asks | `/outspend` answers are taken as given                                                             | An output can be shown as spent (funds hidden) or unspent (the spend fails at broadcast). The wallet asks only in fallbacks: a backfill without a usable spent index, and, after a reorg, records made before block heights were kept. |
+| Leave a spend out of the backfill's spent index, or add one | The index is built from the JSON listings, whose inputs and prevouts no block commits to           | The same, for an output a backfill finds below the block that spent it. A spend of an output the wallet already watches is read from the raw block instead.                                                                            |
+| Show a mempool spend that does not exist                    | A mempool spend without a Taproot output is read from its JSON listing                             | The output is hidden until no block has confirmed the spend for two hours and the wallet has scanned every block; it then counts as unspent again.                                                                                     |
+
+## What the explorer learns
+
+- **The IP address and the request pattern.** These include the account's scan progress.
+- **Which blocks hold a candidate.** A raw block is fetched for a block with a Taproot output, a Taproot spend, a spend of an output the wallet watches, or an input without a prevout. That is about a fifth of mainnet blocks and almost every non-empty testnet block, so a fetch says little about the wallet.
+- **Mempool transactions with a Taproot output.** Their raw hex is fetched whether they match or not, so no fetch reveals a match.
+- **Outputs the wallet owns, in the fallbacks above.** Each `/outspend` or `/tx/{txid}/status` request names an output of the wallet. In normal operation no request names one: spends are found in the blocks scanned, and a reorg is handled by rescanning the replaced blocks.
+
+## Reducing the trust
+
+Set **Explorer URL** in the chain settings to an Esplora server you run (the scanner uses `<Explorer URL>/api`). A chain with its own explorer is scanned through that server alone, without public fallbacks, so all the trust above stays with your server.

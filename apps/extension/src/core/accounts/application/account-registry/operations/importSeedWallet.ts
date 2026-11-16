@@ -8,12 +8,15 @@ import type { AccountModelState } from "../model/account-model";
 import type { AccountGroupId, KeySourceId, WalletId } from "../model/identifiers";
 import type { KeySourceRecord } from "../model/key-source";
 import type { WalletRecord } from "../model/wallet";
+import { keySourceMetadata } from "./createLocalRootAccountModel";
 
 export type ImportSeedWalletInput = {
 	accountModel: AccountModelState;
 	createdAt?: number;
 	keySourceId?: KeySourceId;
 	name?: string;
+	/** When the user says the wallet was created (ms since epoch). */
+	walletCreatedAt?: number;
 };
 
 export type ImportSeedWalletResult = {
@@ -35,7 +38,7 @@ export function importSeedWallet(input: ImportSeedWalletInput): ImportSeedWallet
 		id: keySourceId,
 		kind: "imported-mnemonic",
 		material: { kind: "seed", storage: "encrypted-vault" },
-		metadata: { source: "imported" },
+		metadata: keySourceMetadata("imported", input.walletCreatedAt),
 		name,
 		updatedAt: now,
 	};

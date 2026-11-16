@@ -232,6 +232,10 @@ export function getUnlockedSecureVaultStorage(): SecureVaultStorage {
 	return unlockedStorage;
 }
 
+export function getOptionalUnlockedSecureVaultStorage(): SecureVaultStorage | null {
+	return unlockedStorage;
+}
+
 function applyUnlockedSecureVault(record: SecureVaultMetaRecord, dataKey: CryptoKey): void {
 	unlockedMetaRecord = record;
 	unlockedStorage = createBrowserSecureVaultStorage({

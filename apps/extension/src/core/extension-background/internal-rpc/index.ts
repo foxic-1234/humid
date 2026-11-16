@@ -10,15 +10,17 @@ import type {
 	TransferReview,
 } from "@/core/accounts/application/accounts-rpc/model/types";
 import type { ChainGroup } from "@/core/chains/application/ChainGroup";
+import { walletVaultRpc } from "@/core/secure-vault/application/wallet-vault/model/rpc";
 import type { ConfirmationRequest } from "@/helpers/background";
 
 import type { ConfirmationResponder } from "../confirmations";
 import type { RequestHandlerMap } from "../transport";
-import { createAccountsInternalHandlers } from "./accounts";
+import { createAccountsInternalHandlers, type SilentPaymentLabelsDeps } from "./accounts";
 import { createChainsInternalHandlers } from "./chains";
 import { walletVaultInternalHandlers } from "./wallet-vault";
 import { walletConnectInternalHandlers } from "./walletconnect";
 
+export type { SilentPaymentLabelsDeps } from "./accounts";
 export { syncWalletVaultAuthStore } from "./wallet-vault";
 
 export type CreateInternalRpcHandlersInput = {
@@ -33,6 +35,16 @@ export type CreateInternalRpcHandlersInput = {
 	purgeAccountWalletConnectSessions: (accountGroupIds: readonly string[]) => Promise<void>;
 	refreshPortfolio: () => Promise<PortfolioSnapshot>;
 	sendTransfer: (input: SendTransferInput) => Promise<SendTransferResult>;
+	getSilentPaymentScanStatus?: (
+		input?: import("@/core/accounts/application/accounts-rpc/model/types").GetSilentPaymentScanStatusInput,
+	) => Promise<
+		import("@/core/accounts/application/accounts-rpc/model/types").SilentPaymentScanStatusResult
+	>;
+	rescanSilentPayments?: (
+		input: import("@/core/accounts/application/accounts-rpc/model/types").RescanSilentPaymentsInput,
+	) => Promise<void>;
+	onWalletUnlocked?: () => void;
+	silentPaymentLabels?: SilentPaymentLabelsDeps;
 };
 
 export function createInternalRpcHandlers({
@@ -47,6 +59,10 @@ export function createInternalRpcHandlers({
 	purgeAccountWalletConnectSessions,
 	refreshPortfolio,
 	sendTransfer,
+	getSilentPaymentScanStatus,
+	onWalletUnlocked,
+	rescanSilentPayments,
+	silentPaymentLabels,
 }: CreateInternalRpcHandlersInput): RequestHandlerMap {
 	return {
 		ping: (message) => {
@@ -68,6 +84,15 @@ export function createInternalRpcHandlers({
 			return decision.approved;
 		},
 		...walletVaultInternalHandlers,
+		[walletVaultRpc.methods.unlock]: async (message, sender) => {
+			const res = await walletVaultInternalHandlers[walletVaultRpc.methods.unlock](message, sender);
+			try {
+				onWalletUnlocked?.();
+			} catch (e) {
+				console.warn("[internal-rpc] onWalletUnlocked hook failed:", e);
+			}
+			return res;
+		},
 		...walletConnectInternalHandlers,
 		...createChainsInternalHandlers(chainGroups),
 		...createAccountsInternalHandlers({
@@ -80,6 +105,9 @@ export function createInternalRpcHandlers({
 			purgeAccountWalletConnectSessions,
 			refreshPortfolio,
 			sendTransfer,
+			getSilentPaymentScanStatus,
+			rescanSilentPayments,
+			silentPaymentLabels,
 		}),
 	};
 }

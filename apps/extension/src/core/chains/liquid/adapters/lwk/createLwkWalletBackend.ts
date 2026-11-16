@@ -5,6 +5,7 @@ import {
 	getWalletAddress,
 	getWalletReceiveAddress,
 	getWalletSigningAddress,
+	getWalletSilentPaymentAddress,
 } from "./wallet/getReceiveAddress";
 import {
 	getExplicitWalletUtxosForAsset,
@@ -27,6 +28,7 @@ export function createLwkWalletBackend(): LiquidWalletBackend {
 		getAddress: getWalletAddress,
 		getBalance: getWalletBalanceForAsset,
 		getReceiveAddress: getWalletReceiveAddress,
+		getSilentPaymentAddress: getWalletSilentPaymentAddress,
 		getSigningAddress: getWalletSigningAddress,
 		getDescriptorEntries: getWalletDescriptorEntries,
 		getExplicitUtxos: getExplicitWalletUtxosForAsset,

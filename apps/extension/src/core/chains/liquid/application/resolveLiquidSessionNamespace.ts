@@ -41,6 +41,8 @@ export async function resolveLiquidSessionNamespace({
 						...walletContext,
 						chain,
 					});
+					// Only the identifier is needed; wipe the keys the account was derived with.
+					account.wipePrivateData?.();
 
 					return account.accountIdentifier;
 				} catch {

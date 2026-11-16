@@ -12,7 +12,7 @@ import {
 } from "../../../domain/LiquidRpc";
 import { parseLiquidAssetId, parseLiquidSendTransferParams } from "../../../domain/validation";
 import type { LiquidWalletAccount, LiquidWalletBackend } from "../../backends/LiquidWalletBackend";
-import { resolveDappAccount } from "../../dappAccountScope";
+import { resolveDappAccount, wipeReviewedAccount } from "../../dappAccountScope";
 
 export type LiquidSendTransferContext = WalletRpcBaseContext & {
 	chain: LiquidChainRecord;
@@ -53,22 +53,29 @@ export const sendLiquidTransfer = createWalletMethod<
 			.join("\n\n"),
 		title: "Send Liquid transfer?",
 	}),
+	dispose: wipeReviewedAccount,
 	execute: ({ context, params, review }) =>
 		context.walletBackend.sendTransfer(review.account, params, review.requestedAsset.rawAssetId),
 	id: LIQUID_WALLET_RPC_METHODS.SEND_TRANSFER,
 	parse: parseLiquidSendTransferParams,
 	review: async ({ context, params }) => {
 		const account = await resolveDappAccount(context, params.account);
-		const requestedAsset = resolveRequestedAsset(params.assetId, account);
+		try {
+			const requestedAsset = resolveRequestedAsset(params.assetId, account);
 
-		await context.walletBackend.syncAccount(account);
+			await context.walletBackend.syncAccount(account);
 
-		const transfer = await context.walletBackend.inspectTransfer(
-			account,
-			params,
-			requestedAsset.rawAssetId,
-		);
-		return { account, requestedAsset, transfer };
+			const transfer = await context.walletBackend.inspectTransfer(
+				account,
+				params,
+				requestedAsset.rawAssetId,
+			);
+			return { account, requestedAsset, transfer };
+		} catch (error) {
+			// No review comes back, so nothing would dispose of the account.
+			wipeReviewedAccount({ account });
+			throw error;
+		}
 	},
 });
 

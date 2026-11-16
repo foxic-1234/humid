@@ -1,0 +1,697 @@
+import type { SpTxInput } from "@humid/sp-core";
+
+import type { LiquidChainRecord, LiquidNetworkKind } from "../chains/LiquidChainRecord";
+
+/**
+ * Build a safe Esplora `/api` base URL from the chain's `explorerUrl` setting.
+ *
+ * Defense-in-depth: rejects non-HTTP(S) schemes (`javascript:`, `data:`, etc.)
+ * to prevent URL-based exfiltration even if a malicious chain config is injected.
+ */
+export function buildExplorerApi(chain: Pick<LiquidChainRecord, "id" | "settings">): string {
+	const raw = chain.settings?.explorerUrl;
+	if (!raw) {
+		const backendUrl = chain.settings?.backend?.url;
+		if (backendUrl && !chain.settings?.backend?.waterfalls) {
+			try {
+				const parsed = new URL(backendUrl.replace(/\/+$/, ""));
+				if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+					return parsed.href.replace(/\/+$/, "");
+				}
+			} catch {
+				// Fall through to throw below.
+			}
+		}
+		throw new Error(`[sp-explorer] No explorer URL configured for chain ${chain.id}`);
+	}
+	try {
+		const parsed = new URL(raw.replace(/\/+$/, ""));
+		if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+			throw new Error(`Unsafe explorer URL scheme: ${parsed.protocol}`);
+		}
+		return `${parsed.href.replace(/\/+$/, "")}/api`;
+	} catch (err) {
+		throw new Error(`[sp-explorer] Invalid or unsafe explorer URL: ${err}`, { cause: err });
+	}
+}
+
+/**
+ * Timeout of one explorer request. A busy public Esplora queues requests for seconds; a request
+ * cut short counts as a failure and halves the rate, so it must not be cut before a slow answer.
+ */
+export const EXPLORER_TIMEOUT_MS = 10_000;
+
+export async function fetchWithTimeout(
+	url: string,
+	init?: RequestInit,
+	timeoutMs = EXPLORER_TIMEOUT_MS,
+): Promise<Response> {
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await fetch(url, {
+			...init,
+			signal: controller.signal,
+		});
+	} finally {
+		clearTimeout(timeoutId);
+	}
+}
+
+/**
+ * Requests to one explorer in flight at once. Enough to reach the rate ceiling at a second or two
+ * of latency, few enough not to burst: a burst is what a public Esplora punishes first.
+ */
+export const MAX_CONCURRENT_EXPLORER_REQUESTS = 16;
+/** Longest pause after a 429 without a usable Retry-After. */
+const MAX_RATE_LIMIT_COOLDOWN_MS = 30_000;
+/** How long a server that answered 429, or kept failing, is passed over when a scan picks one. */
+const RATE_LIMITED_AVOID_MS = 5 * 60_000;
+/**
+ * Failures in a row (dropped connections, timeouts, 5xx) before a server is passed over: a single
+ * one happens on a healthy server too, and moving to a fallback that is down stalls the scan.
+ */
+const FAILURES_BEFORE_AVOID = 3;
+/** How long a fallback that failed is passed over. */
+const FALLBACK_FAILED_AVOID_MS = 30 * 60_000;
+/**
+ * Request starts per second to one server: a run starts slow and, every `RATE_STEP_UP_MS` the
+ * server keeps answering, doubles its rate until the first failure and speeds up by one after it,
+ * up to the ceiling; any failure halves it. The ceiling only shapes a burst: Blockstream answered
+ * 20 a second cleanly and 30 with the odd 429, but what it limits is requests an hour (see
+ * `HOURLY_REQUEST_BUDGETS`), which a burst at the ceiling spends in half a minute.
+ */
+export const INITIAL_EXPLORER_REQUESTS_PER_SECOND = 3;
+export const MAX_EXPLORER_REQUESTS_PER_SECOND = 20;
+const RATE_STEP_UP_MS = 10_000;
+/**
+ * Servers used when the primary one fails or its hour of requests is spent, which is where most of
+ * a long scan is read from. A probe from one IP found liquid.network clean at 15 requests a second
+ * for a minute (and at 8 for three) and answering 429 within seconds at 20, with no ban after it;
+ * the ceiling leaves room for other wallets behind the same IP and for limits over longer windows,
+ * which the probe did not reach.
+ */
+const FALLBACK_EXPLORER_ORIGINS = new Set(["https://liquid.network"]);
+export const FALLBACK_EXPLORER_REQUESTS_PER_SECOND = 10;
+
+/**
+ * Requests an hour the scanner allows itself on a server that caps them per IP. Without an API key
+ * Blockstream answers 429 past 700 an hour (and 500,000 a month), with no Retry-After, and for
+ * every path. The LWK wallet syncs through the same server from the same IP, so the scanner keeps
+ * under half; the block windows in flight when its allowance runs out still finish, a hundred
+ * requests or so. Measured with `scripts/explorerRateProbe.ts`.
+ */
+const HOURLY_REQUEST_BUDGETS = new Map<string, number>([["https://blockstream.info", 300]]);
+const BUDGET_WINDOW_MS = 60 * 60_000;
+/** Requests are counted by the minute they started in. */
+const BUDGET_BUCKET_MS = 60_000;
+/**
+ * How long a server with an hourly cap is left alone after a 429 without a Retry-After: its hour
+ * is spent, by this wallet or by anything else behind the IP, and asking again only adds to it.
+ * Blockstream answered again 44 minutes after a probe spent its hour at once.
+ */
+export const HOURLY_LIMIT_AVOID_MS = 60 * 60_000;
+/** The request counts are saved for the next service worker at most this often. */
+const BUDGET_PERSIST_INTERVAL_MS = 2000;
+
+/** Thrown before any request when the run's only explorer has no requests left this hour. */
+export class ExplorerBudgetError extends Error {
+	constructor() {
+		super("The block explorer's hourly request limit is reached; scanning resumes later.");
+		this.name = "ExplorerBudgetError";
+	}
+}
+
+/** Request slots, rate and rate-limit pause of one explorer server, keyed by origin. */
+type ExplorerLimiter = {
+	/** A scan picks another public explorer until then: set by a 429 or a failed connection. */
+	avoidUntil: number;
+	/** Requests an hour the scanner allows itself here; undefined without a cap. */
+	budget?: number;
+	/** The hour's allowance is spent until then: by the count below, or because a 429 said so. */
+	budgetSpentUntil: number;
+	ceiling: number;
+	consecutiveFailures: number;
+	consecutiveRateLimits: number;
+	/** No request to this server starts before this time: set by a 429. */
+	cooldownUntil: number;
+	inFlight: number;
+	/** When the rate last changed: it steps up only after a clean `RATE_STEP_UP_MS`. */
+	lastRateChangeAt: number;
+	lastPersistedAt: number;
+	/** The next request may start at this time, at most `rate` a second. */
+	nextStartAt: number;
+	origin: string;
+	queue: Array<() => void>;
+	rate: number;
+	/** Doubling the rate on each step up: until the server's first failure. */
+	slowStart: boolean;
+	/** Requests started in the last hour as [minute start, count], oldest first; with a budget. */
+	spent: Array<[number, number]>;
+};
+
+const explorerLimiters = new Map<string, ExplorerLimiter>();
+/** Test-only: a fixed rate for every server instead of the adaptive one. */
+let fixedRate: number | undefined;
+/** Test-only: the hourly budget of the servers that have one. */
+let testBudget: number | undefined;
+/** Requests started since the service worker began, on every server. */
+let requestsStarted = 0;
+
+/**
+ * Limiter state kept in `chrome.storage.session`, so a service worker woken by the next refresh
+ * neither starts over at the initial rate nor forgets a server's pause or ban.
+ */
+const LIMITERS_SESSION_KEY = "humid_explorer_limiters";
+/** A learned rate older than this is not trusted: the server's load may have changed since. */
+const PERSISTED_RATE_TTL_MS = 30 * 60_000;
+
+type PersistedLimiter = Pick<
+	ExplorerLimiter,
+	"avoidUntil" | "budgetSpentUntil" | "cooldownUntil" | "rate" | "slowStart" | "spent"
+> & { savedAt: number };
+
+export type SessionArea = {
+	get: (key: string) => Promise<Record<string, unknown>>;
+	set: (items: Record<string, unknown>) => Promise<void>;
+};
+
+/** `chrome.storage.session` where this context has it (an MV3 extension), else undefined. */
+export function sessionArea(): SessionArea | undefined {
+	return (globalThis as { chrome?: { storage?: { session?: SessionArea } } }).chrome?.storage
+		?.session;
+}
+
+let persistedLimiters: Record<string, PersistedLimiter> = {};
+let limitersRestored: Promise<void> | undefined;
+let limitersRestoredDone = false;
+
+/**
+ * Read the persisted limiter states once per service worker; best effort. A scan awaits it before
+ * it picks an explorer, so a server paused or banned before the worker slept stays passed over.
+ */
+export function restoreExplorerLimiters(): Promise<void> {
+	return restoreLimiters();
+}
+
+function restoreLimiters(): Promise<void> {
+	limitersRestored ??= (async () => {
+		try {
+			const stored = (await sessionArea()?.get(LIMITERS_SESSION_KEY))?.[LIMITERS_SESSION_KEY];
+			if (stored && typeof stored === "object") {
+				persistedLimiters = stored as Record<string, PersistedLimiter>;
+			}
+		} catch {
+			// No persisted state: every server starts fresh.
+		} finally {
+			limitersRestoredDone = true;
+		}
+	})();
+	return limitersRestored;
+}
+
+/** Save a server's limiter state for the next service worker; best effort. */
+function persistLimiter(limiter: ExplorerLimiter): void {
+	const area = sessionArea();
+	if (!area) return;
+	limiter.lastPersistedAt = Date.now();
+	persistedLimiters[limiter.origin] = {
+		avoidUntil: limiter.avoidUntil,
+		budgetSpentUntil: limiter.budgetSpentUntil,
+		cooldownUntil: limiter.cooldownUntil,
+		rate: limiter.rate,
+		savedAt: Date.now(),
+		slowStart: limiter.slowStart,
+		spent: limiter.spent,
+	};
+	area.set({ [LIMITERS_SESSION_KEY]: persistedLimiters }).catch(() => {});
+}
+
+function limiterFor(url: string): ExplorerLimiter {
+	const origin = new URL(url).origin;
+	let limiter = explorerLimiters.get(origin);
+	if (!limiter) {
+		const ceiling =
+			fixedRate ??
+			(FALLBACK_EXPLORER_ORIGINS.has(origin)
+				? FALLBACK_EXPLORER_REQUESTS_PER_SECOND
+				: MAX_EXPLORER_REQUESTS_PER_SECOND);
+		limiter = {
+			avoidUntil: 0,
+			// A test's fixed rate also lifts the budgets, unless it sets one.
+			budget: HOURLY_REQUEST_BUDGETS.has(origin)
+				? (testBudget ?? (fixedRate === undefined ? HOURLY_REQUEST_BUDGETS.get(origin) : undefined))
+				: undefined,
+			budgetSpentUntil: 0,
+			ceiling,
+			consecutiveFailures: 0,
+			consecutiveRateLimits: 0,
+			cooldownUntil: 0,
+			inFlight: 0,
+			lastPersistedAt: 0,
+			lastRateChangeAt: Date.now(),
+			nextStartAt: 0,
+			origin,
+			queue: [],
+			rate: Math.min(fixedRate ?? INITIAL_EXPLORER_REQUESTS_PER_SECOND, ceiling),
+			slowStart: true,
+			spent: [],
+		};
+		const saved = persistedLimiters[origin];
+		if (saved) {
+			// Pauses and bans are absolute times: they hold whatever their age. So do the hour's
+			// request counts, which `budgetUsed` drops as they age.
+			limiter.avoidUntil = Number(saved.avoidUntil) || 0;
+			limiter.cooldownUntil = Number(saved.cooldownUntil) || 0;
+			limiter.budgetSpentUntil = Number(saved.budgetSpentUntil) || 0;
+			if (Array.isArray(saved.spent)) {
+				limiter.spent = saved.spent
+					.filter((entry) => Array.isArray(entry) && entry.length === 2)
+					.map(([start, count]) => [Number(start), Number(count)] as [number, number])
+					.filter(([start, count]) => Number.isFinite(start) && count > 0);
+			}
+			if (fixedRate === undefined && Date.now() - saved.savedAt < PERSISTED_RATE_TTL_MS) {
+				limiter.rate = Math.min(ceiling, Math.max(1, Number(saved.rate) || limiter.rate));
+				limiter.slowStart = saved.slowStart === true;
+			}
+		}
+		explorerLimiters.set(origin, limiter);
+	}
+	return limiter;
+}
+
+/**
+ * Test-only: forget every server's state, as a new service worker does (what `chrome.storage.session`
+ * holds stays); optionally fix the rate (no ramp, no halving).
+ */
+export function resetExplorerLimiterForTesting(
+	options: { hourlyBudget?: number; requestsPerSecond?: number } = {},
+): void {
+	explorerLimiters.clear();
+	persistedLimiters = {};
+	limitersRestored = undefined;
+	limitersRestoredDone = false;
+	fixedRate = options.requestsPerSecond;
+	testBudget = options.hourlyBudget;
+}
+
+/** Requests started on the server in the last hour; forgets the older ones. */
+function budgetUsed(limiter: ExplorerLimiter, now: number): number {
+	const oldest = now - BUDGET_WINDOW_MS - BUDGET_BUCKET_MS;
+	while (limiter.spent.length > 0 && limiter.spent[0]![0] <= oldest) {
+		limiter.spent.shift();
+	}
+	return limiter.spent.reduce((sum, [, count]) => sum + count, 0);
+}
+
+/** The server's hour is spent until `until`: scans pick another explorer, or wait. */
+function markBudgetSpent(limiter: ExplorerLimiter, until: number): void {
+	limiter.budgetSpentUntil = Math.max(limiter.budgetSpentUntil, until);
+	limiter.avoidUntil = Math.max(limiter.avoidUntil, until);
+	persistLimiter(limiter);
+}
+
+/**
+ * Count a request about to start against the server's hourly budget. Once the budget is used the
+ * server counts as spent until half of it is free again: coming back for every request that ages
+ * out would start a run for a handful of blocks.
+ */
+function countAgainstBudget(limiter: ExplorerLimiter): void {
+	requestsStarted++;
+	const { budget } = limiter;
+	if (budget === undefined) return;
+	const now = Date.now();
+	const bucket = Math.floor(now / BUDGET_BUCKET_MS) * BUDGET_BUCKET_MS;
+	const last = limiter.spent[limiter.spent.length - 1];
+	if (last && last[0] === bucket) last[1]++;
+	else limiter.spent.push([bucket, 1]);
+
+	let used = budgetUsed(limiter, now);
+	if (now >= limiter.budgetSpentUntil && used >= budget) {
+		let until = now;
+		for (const [start, count] of limiter.spent) {
+			if (used <= budget / 2) break;
+			used -= count;
+			until = start + BUDGET_BUCKET_MS + BUDGET_WINDOW_MS;
+		}
+		markBudgetSpent(limiter, until);
+	} else if (now - limiter.lastPersistedAt >= BUDGET_PERSIST_INTERVAL_MS) {
+		persistLimiter(limiter);
+	}
+}
+
+/**
+ * Whether the scanner has used up the hour's requests on `api`'s server, or the server said so
+ * with a 429. A scan then takes no further block window from it.
+ */
+export function explorerBudgetSpent(api: string): boolean {
+	return Date.now() < limiterFor(api).budgetSpentUntil;
+}
+
+/** Requests started since the service worker began, on every explorer. */
+export function explorerRequestsStarted(): number {
+	return requestsStarted;
+}
+
+/**
+ * Requests a second the explorers can keep answering for hours: a server with an hourly budget
+ * gives that budget, another one its rate ceiling unless it is being passed over. A burst on a
+ * budgeted server runs a hundred times faster, for seconds.
+ */
+export function sustainedExplorerRequestRate(apis: string[]): number {
+	const now = Date.now();
+	let rate = 0;
+	for (const origin of new Set(apis.map((api) => new URL(api).origin))) {
+		const limiter = limiterFor(origin);
+		if (limiter.budget !== undefined) rate += limiter.budget / (BUDGET_WINDOW_MS / 1000);
+		else if (limiter.avoidUntil <= now) rate += limiter.ceiling;
+	}
+	return rate;
+}
+
+/** Test-only: the current request rate of the server `url` is on. */
+export function explorerRateForTesting(url: string): number {
+	return limiterFor(url).rate;
+}
+
+/**
+ * The server answered: after a clean `RATE_STEP_UP_MS`, twice the rate while it has never failed,
+ * else one more request a second.
+ */
+function rateUp(limiter: ExplorerLimiter): void {
+	const now = Date.now();
+	if (fixedRate !== undefined || limiter.rate >= limiter.ceiling) return;
+	if (now - limiter.lastRateChangeAt < RATE_STEP_UP_MS) return;
+	limiter.rate = Math.min(limiter.ceiling, limiter.slowStart ? limiter.rate * 2 : limiter.rate + 1);
+	limiter.lastRateChangeAt = now;
+	persistLimiter(limiter);
+}
+
+/**
+ * Any failure halves the rate and ends the doubling: a hard ban comes as dropped connections or
+ * timeouts, not as a 429, so every failure is taken as a warning.
+ */
+function rateDown(limiter: ExplorerLimiter): void {
+	limiter.slowStart = false;
+	if (fixedRate !== undefined) return;
+	limiter.rate = Math.max(1, limiter.rate / 2);
+	limiter.lastRateChangeAt = Date.now();
+}
+
+/**
+ * A failure without a 429: slower at once, passed over after `FAILURES_BEFORE_AVOID` in a row. A
+ * fallback is passed over at its first failure, and for long: it is there only for when the
+ * primary fails, and one that cannot be reached (blocked in some networks) costs a timeout a
+ * request.
+ */
+function failed(limiter: ExplorerLimiter): void {
+	rateDown(limiter);
+	limiter.consecutiveFailures++;
+	if (FALLBACK_EXPLORER_ORIGINS.has(limiter.origin)) {
+		limiter.avoidUntil = Date.now() + FALLBACK_FAILED_AVOID_MS;
+	} else if (limiter.consecutiveFailures >= FAILURES_BEFORE_AVOID) {
+		limiter.avoidUntil = Date.now() + RATE_LIMITED_AVOID_MS;
+	}
+	persistLimiter(limiter);
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Up to a second more, so wallets behind one IP that paused together do not resume together. */
+const jitter = () => Math.random() * 1000;
+
+/**
+ * One request to a block explorer: per server at most `MAX_CONCURRENT_EXPLORER_REQUESTS` run at
+ * once and the server's adaptive rate start a second; after a 429 every request to that server
+ * waits out a shared pause (Retry-After, else doubling up to 30 s, plus jitter). A 429, or a few
+ * failures in a row, also has scans pick another public explorer for a while.
+ */
+export async function fetchFromExplorer(
+	url: string,
+	init?: RequestInit,
+	timeoutMs = EXPLORER_TIMEOUT_MS,
+): Promise<Response> {
+	if (!limitersRestoredDone) await restoreLimiters();
+	const limiter = limiterFor(url);
+	while (limiter.inFlight >= MAX_CONCURRENT_EXPLORER_REQUESTS) {
+		await new Promise<void>((resolve) => limiter.queue.push(resolve));
+	}
+	limiter.inFlight++;
+	try {
+		const startAt = Math.max(limiter.cooldownUntil, limiter.nextStartAt, Date.now());
+		limiter.nextStartAt = startAt + 1000 / limiter.rate;
+		const wait = startAt - Date.now();
+		if (wait > 0) await sleep(wait);
+		countAgainstBudget(limiter);
+
+		let res: Response;
+		try {
+			res = await fetchWithTimeout(url, init, timeoutMs);
+		} catch (error) {
+			failed(limiter);
+			throw error;
+		}
+		if (res.status === 429) {
+			rateDown(limiter);
+			limiter.consecutiveRateLimits++;
+			const retryAfter = Number.parseInt(res.headers.get("Retry-After") ?? "", 10);
+			const timed = Number.isFinite(retryAfter) && retryAfter > 0;
+			if (limiter.budget !== undefined && !timed) {
+				// The hourly cap, not a burst: no pause of seconds outlasts it, so requests are not
+				// held back to retry; the server is left alone instead.
+				markBudgetSpent(limiter, Date.now() + HOURLY_LIMIT_AVOID_MS);
+				return res;
+			}
+			const pause =
+				(timed
+					? Math.min(retryAfter * 1000, 2 * MAX_RATE_LIMIT_COOLDOWN_MS)
+					: Math.min(1000 * 2 ** (limiter.consecutiveRateLimits - 1), MAX_RATE_LIMIT_COOLDOWN_MS)) +
+				jitter();
+			limiter.cooldownUntil = Math.max(limiter.cooldownUntil, Date.now() + pause);
+			limiter.avoidUntil = Date.now() + Math.max(pause, RATE_LIMITED_AVOID_MS);
+			persistLimiter(limiter);
+		} else if (res.status >= 500) {
+			failed(limiter);
+		} else {
+			limiter.consecutiveFailures = 0;
+			limiter.consecutiveRateLimits = 0;
+			rateUp(limiter);
+		}
+		return res;
+	} finally {
+		limiter.inFlight--;
+		limiter.queue.shift()?.();
+	}
+}
+
+/**
+ * Public Esplora APIs per network. When the chain uses one of them, the scanner may use any:
+ * block hashes are the same everywhere, and spreading the load keeps it under rate limits. A chain
+ * with its own explorer (say, a self-hosted one) is only ever scanned through that one.
+ */
+const PUBLIC_EXPLORER_APIS: Partial<Record<LiquidNetworkKind, string[]>> = {
+	mainnet: ["https://blockstream.info/liquid/api", "https://liquid.network/api"],
+	testnet: [
+		"https://blockstream.info/liquidtestnet/api",
+		"https://liquid.network/liquidtestnet/api",
+	],
+};
+
+/** The Esplora APIs a scan may use: the configured one first, then the other public ones. */
+export function buildExplorerApis(chain: Pick<LiquidChainRecord, "id" | "settings">): string[] {
+	const configured = buildExplorerApi(chain);
+	const publicApis = PUBLIC_EXPLORER_APIS[chain.settings.network] ?? [];
+	return publicApis.includes(configured)
+		? [configured, ...publicApis.filter((api) => api !== configured)]
+		: [configured];
+}
+
+/**
+ * The first API whose server has not answered 429 in the last minutes, else the one passed over
+ * the shortest. A run sticks to its pick; the request-level pause handles a 429 within it.
+ */
+export function pickExplorerApi(apis: string[]): string {
+	return usableExplorerApis(apis)[0]!;
+}
+
+/**
+ * Every API whose server has not answered 429 (or failed) in the last minutes, in the given order
+ * (the chain's own explorer first, then fallbacks); if all have, the one passed over the shortest.
+ */
+export function usableExplorerApis(apis: string[]): string[] {
+	const now = Date.now();
+	const avoidedUntil = (api: string) => {
+		const origin = new URL(api).origin;
+		return (
+			explorerLimiters.get(origin)?.avoidUntil ??
+			(Number(persistedLimiters[origin]?.avoidUntil) || 0)
+		);
+	};
+	const usable = apis.filter((api) => avoidedUntil(api) <= now);
+	return usable.length > 0
+		? usable
+		: [apis.reduce((best, api) => (avoidedUntil(api) < avoidedUntil(best) ? api : best))];
+}
+
+export async function fetchWithRetryAndBackoff(
+	url: string,
+	init?: RequestInit,
+	timeoutMs = EXPLORER_TIMEOUT_MS,
+	maxRetries = 3,
+): Promise<Response> {
+	let attempt = 0;
+	while (attempt <= maxRetries) {
+		try {
+			const res = await fetchFromExplorer(url, init, timeoutMs);
+			if (res.status === 429) {
+				attempt++;
+				// An hour's cap does not lift within a retry.
+				if (attempt > maxRetries || explorerBudgetSpent(url)) {
+					return res;
+				}
+				// The next attempt waits out the pause this 429 set.
+				continue;
+			}
+			return res;
+		} catch (err) {
+			attempt++;
+			if (attempt > maxRetries) {
+				throw err;
+			}
+			await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+		}
+	}
+	throw new Error(`Failed to fetch ${url} after retries`);
+}
+
+/**
+ * Fill `prevoutScriptPubKey` from Esplora for inputs whose parent transaction is not at hand.
+ * Coinbase and peg-in inputs never need one.
+ */
+export async function resolveMissingPrevouts(vin: SpTxInput[], explorerApi: string): Promise<void> {
+	const missing = vin.filter(
+		(v) =>
+			!v.isCoinbase &&
+			!v.isPegin &&
+			!v.prevoutScriptPubKey &&
+			((v.witness?.length ?? 0) > 0 || (v.scriptsig?.length ?? 0) > 0),
+	);
+	if (missing.length === 0) return;
+
+	const failed: string[] = [];
+	await Promise.all(
+		missing.map(async (input) => {
+			try {
+				const res = await fetchFromExplorer(`${explorerApi}/tx/${input.txid}`);
+				const out = res.ok
+					? ((await res.json()) as { vout?: { scriptpubkey?: string }[] }).vout?.[input.vout]
+					: undefined;
+				if (out?.scriptpubkey) {
+					input.prevoutScriptPubKey = out.scriptpubkey;
+					return;
+				}
+				failed.push(`${input.txid}:${input.vout} (status: ${res.status})`);
+			} catch (err) {
+				failed.push(
+					`${input.txid}:${input.vout} (${err instanceof Error ? err.message : String(err)})`,
+				);
+			}
+		}),
+	);
+
+	if (failed.length > 0) {
+		throw new Error(
+			`[sp-explorer] Failed to resolve required prevout(s) for input aggregation: ${failed.join(", ")}`,
+		);
+	}
+}
+
+/**
+ * Whether an outpoint is spent, and by which transaction, as the explorer sees it.
+ * Returns null when the explorer gave no usable answer (network error, non-2xx, malformed body).
+ */
+export async function fetchOutspend(
+	explorerApi: string,
+	txid: string,
+	vout: number,
+): Promise<{ spent: boolean; txid?: string } | null> {
+	try {
+		const res = await fetchFromExplorer(`${explorerApi}/tx/${txid}/outspend/${vout}`);
+		if (!res.ok) return null;
+		const body = (await res.json()) as { spent?: unknown; txid?: unknown };
+		if (typeof body?.spent !== "boolean") return null;
+		return { spent: body.spent, txid: typeof body.txid === "string" ? body.txid : undefined };
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Raw hex of a transaction the explorer knows (in a block or in its mempool). `notFound` is a
+ * definite 404; null means the explorer gave no usable answer.
+ *
+ * Existence is proven by `/tx/{txid}/hex`, not by `/tx/{txid}/status`: Esplora answers the latter
+ * with `{"confirmed":false}` and HTTP 200 even for a txid it has never seen.
+ */
+export async function fetchTxHex(
+	explorerApi: string,
+	txid: string,
+): Promise<{ hex: string } | { notFound: true } | null> {
+	try {
+		const res = await fetchFromExplorer(`${explorerApi}/tx/${txid}/hex`);
+		if (res.status === 404) return { notFound: true };
+		if (!res.ok) return null;
+		const hex = (await res.text()).trim().toLowerCase();
+		return /^(?:[0-9a-f]{2})+$/.test(hex) ? { hex } : null;
+	} catch {
+		return null;
+	}
+}
+
+export type ExplorerTxStatus = {
+	block_height?: number;
+	block_time?: number;
+	confirmed: boolean;
+};
+
+/**
+ * A transaction's confirmation status as the explorer sees it.
+ * `confirmed: false` does not prove the transaction exists (see `fetchTxHex`).
+ * Returns null when the explorer gave no usable answer.
+ */
+export async function fetchTxStatus(
+	explorerApi: string,
+	txid: string,
+): Promise<ExplorerTxStatus | null> {
+	try {
+		const res = await fetchFromExplorer(`${explorerApi}/tx/${txid}/status`);
+		if (res.status === 404) {
+			return { confirmed: false };
+		}
+		if (!res.ok) return null;
+		const body = (await res.json()) as {
+			block_height?: unknown;
+			block_time?: unknown;
+			confirmed?: unknown;
+		};
+		if (typeof body?.confirmed !== "boolean") return null;
+		return {
+			block_height: typeof body.block_height === "number" ? body.block_height : undefined,
+			block_time: typeof body.block_time === "number" ? body.block_time : undefined,
+			confirmed: body.confirmed,
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** A scan error as the status card shows it: a timeout or a failed connection in plain words. */
+export function describeExplorerError(error: unknown, fallback: string): string {
+	if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+		return "The block explorer did not answer in time; scanning resumes shortly.";
+	}
+	if (error instanceof TypeError) {
+		return "The block explorer is unreachable; scanning resumes shortly.";
+	}
+	return error instanceof Error ? error.message : fallback;
+}

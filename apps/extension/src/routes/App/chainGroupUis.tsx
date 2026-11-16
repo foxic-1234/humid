@@ -14,6 +14,7 @@ import { LiquidAssetAbout } from "@/core/chains/liquid/presentation/LiquidAssetA
 import { LiquidAssetView } from "@/core/chains/liquid/presentation/LiquidAssetView";
 import { LiquidBalanceHeadline } from "@/core/chains/liquid/presentation/LiquidBalanceHeadline";
 import { liquidExplorerTxUrl } from "@/core/chains/liquid/presentation/liquidExplorerTxUrl";
+import { LiquidScanStatus } from "@/core/chains/liquid/presentation/LiquidScanStatus";
 import { LiquidTokenRow } from "@/core/chains/liquid/presentation/LiquidTokenRow";
 
 type ChainComponent = ComponentType<{ chain: ChainRecord; onChange: (chain: ChainRecord) => void }>;
@@ -34,11 +35,20 @@ type BalanceHeadlineComponent = ComponentType<{
 	native: { amount: bigint; decimals: number; symbol: string };
 }>;
 
+/** How the chain's wallet scanning is going, under the balance on the home screen. */
+type ScanStatusComponent = ComponentType<{
+	chain: ChainRecord;
+	isRetrying?: boolean;
+	onRetry: () => void;
+}>;
+
 export type ChainGroupUi = {
 	AssetAbout: AssetAboutComponent;
 	AssetView: AssetViewComponent;
 	BalanceHeadline: BalanceHeadlineComponent;
 	Create: ChainComponent;
+	/** Absent for a chain group whose wallet does not scan. */
+	ScanStatus?: ScanStatusComponent;
 	Settings: ChainComponent;
 	TokenRow: TokenRowComponent;
 	createDraft: (name: string) => ChainRecord;
@@ -53,6 +63,7 @@ export const chainGroupUis: Record<string, ChainGroupUi> = {
 		AssetView: LiquidAssetView,
 		BalanceHeadline: LiquidBalanceHeadline,
 		Create: LiquidChainCreate as ChainComponent,
+		ScanStatus: LiquidScanStatus,
 		Settings: LiquidChainSettings as ChainComponent,
 		TokenRow: LiquidTokenRow,
 		createDraft: (name) => createCustomLiquidChainRecord(name),

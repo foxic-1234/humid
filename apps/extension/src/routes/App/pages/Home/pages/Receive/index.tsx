@@ -30,8 +30,13 @@ export function ReceivePage() {
 	return (
 		<ReceiveView
 			address={query.data.address}
+			accountGroupId={accountGroup.id}
 			accountName={accountGroup.name}
+			chainId={chain.id}
 			chainName={chain.name}
+			scanPublicKey={query.data.scanPublicKey}
+			silentPaymentAddress={query.data.silentPaymentAddress}
+			spendPublicKey={query.data.spendPublicKey}
 			unconfidential={query.data.unconfidential}
 		/>
 	);

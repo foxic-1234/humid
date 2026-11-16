@@ -1,5 +1,6 @@
 import { getUnlockedChainStoreState } from "@/core/chains/application/chain-store/secureChainStore";
 import { createLocalRootKeyManagerState } from "@/core/key-manager/state/local-root";
+import { toWalletCreatedAt } from "@/core/key-manager/state/wallet-created-at";
 import { keyManagerStore } from "@/core/key-manager/storage/keyManagerStore";
 import {
 	createSecureVault,
@@ -56,6 +57,8 @@ async function create(input: WalletVaultCreateInput): Promise<WalletVaultStatus>
 		const keyManagerState = createLocalRootKeyManagerState({
 			createdAt: Date.now(),
 			seedMaterial,
+			source: input.source,
+			walletCreatedAt: toWalletCreatedAt(input.walletCreatedAt),
 		});
 
 		await keyManagerStore.setUnlockedState(keyManagerState, storage);

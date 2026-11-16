@@ -280,6 +280,11 @@ function LiquidActivityRow({
 }) {
 	const isSent = item.direction === "sent";
 	const isPending = item.status === "pending";
+	const spLabelText = item.isSilentPayment
+		? item.silentPaymentLabel
+			? `SP · ${item.silentPaymentLabel}`
+			: "SP"
+		: null;
 
 	return (
 		<button
@@ -299,10 +304,17 @@ function LiquidActivityRow({
 					{isSent ? "To" : "From"}: {item.counterparty}
 				</p>
 			</div>
-			<p className="text-right font-mono text-sm">
-				{isSent ? "−" : "+"}
-				{formatUnits(item.amount, decimals)} {symbol}
-			</p>
+			<div className="shrink-0 text-right">
+				<p className="font-mono text-sm">
+					{isSent ? "−" : "+"}
+					{formatUnits(item.amount, decimals)} {symbol}
+				</p>
+				{spLabelText ? (
+					<p className="text-muted-foreground max-w-32 truncate text-xs" title={spLabelText}>
+						{spLabelText}
+					</p>
+				) : null}
+			</div>
 		</button>
 	);
 }

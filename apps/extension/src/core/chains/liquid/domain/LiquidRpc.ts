@@ -154,6 +154,7 @@ export type LiquidTransferReview = {
 	amount: string;
 	assetId: LiquidAssetId;
 	chainId: LiquidChainId;
+	isSilentPayment?: boolean;
 	memo?: string;
 	policyAssetId: LiquidAssetId;
 	recipientAddress: string;

@@ -39,7 +39,7 @@ const DEFAULT_FORM_VALUES: CreatePasswordFormValues = {
 
 export function AuthCreatePasswordPage() {
 	const navigate = useNavigate();
-	const { seedMaterial } = useAuthCreateContext();
+	const { seedMaterial, seedSource, walletCreatedAt } = useAuthCreateContext();
 	const {
 		control,
 		formState: { isValid },
@@ -57,7 +57,12 @@ export function AuthCreatePasswordPage() {
 	const confirmPassphraseValue = watch("confirmPassphrase");
 	const createVaultMutation = useMutation({
 		mutationFn: (values: CreatePasswordFormValues) =>
-			walletVaultClient.create({ seedMaterial, passphrase: values.passphrase }),
+			walletVaultClient.create({
+				passphrase: values.passphrase,
+				seedMaterial,
+				source: seedSource,
+				walletCreatedAt,
+			}),
 		onSuccess: () => {
 			reset(DEFAULT_FORM_VALUES);
 			void navigate({ to: "/app" });

@@ -5,20 +5,25 @@ import type {
 	AccountsState,
 	ActivityPage,
 	CreateAccountInput,
+	CreateSilentPaymentLabelInput,
 	EstimateMaxSendInput,
 	EstimateMaxSendResult,
 	GetActivityInput,
 	ImportAccountInput,
+	ListSilentPaymentLabelsInput,
+	ListSilentPaymentLabelsResult,
 	PortfolioSnapshot,
 	ReceiveAddress,
 	RecoveryPhrase,
 	RemoveAccountInput,
 	RemoveWalletInput,
 	RenameAccountInput,
+	RenameSilentPaymentLabelInput,
 	RevealRecoveryPhraseInput,
 	SendTransferInput,
 	SendTransferResult,
 	SetSelectedAccountInput,
+	SilentPaymentLabelView,
 	TransferReview,
 } from "./model/types";
 
@@ -66,6 +71,49 @@ function sendTransfer(input: SendTransferInput): Promise<SendTransferResult> {
 	return requestBackground<SendTransferResult>(accountsRpc.methods.sendTransfer, input);
 }
 
+function getSilentPaymentScanStatus(
+	input?: import("./model/types").GetSilentPaymentScanStatusInput,
+): Promise<import("./model/types").SilentPaymentScanStatusResult> {
+	return requestBackground<import("./model/types").SilentPaymentScanStatusResult>(
+		accountsRpc.methods.getSilentPaymentScanStatus,
+		input,
+	);
+}
+
+function rescanSilentPayments(
+	input: import("./model/types").RescanSilentPaymentsInput,
+): Promise<void> {
+	return requestBackground<void>(accountsRpc.methods.rescanSilentPayments, input);
+}
+
+function listSilentPaymentLabels(
+	input?: ListSilentPaymentLabelsInput,
+): Promise<ListSilentPaymentLabelsResult> {
+	return requestBackground<ListSilentPaymentLabelsResult>(
+		accountsRpc.methods.listSilentPaymentLabels,
+		input,
+	);
+}
+
+/** Create the next label; resolves with its address. */
+function createSilentPaymentLabel(
+	input: CreateSilentPaymentLabelInput,
+): Promise<SilentPaymentLabelView> {
+	return requestBackground<SilentPaymentLabelView>(
+		accountsRpc.methods.createSilentPaymentLabel,
+		input,
+	);
+}
+
+function renameSilentPaymentLabel(
+	input: RenameSilentPaymentLabelInput,
+): Promise<SilentPaymentLabelView> {
+	return requestBackground<SilentPaymentLabelView>(
+		accountsRpc.methods.renameSilentPaymentLabel,
+		input,
+	);
+}
+
 function createAccount(input: CreateAccountInput): Promise<AccountsState> {
 	return requestBackground<AccountsState>(accountsRpc.methods.createAccount, input);
 }
@@ -84,17 +132,22 @@ function removeWallet(input: RemoveWalletInput): Promise<AccountsState> {
 
 export const accountsClient = {
 	createAccount,
+	createSilentPaymentLabel,
 	estimateMaxSend,
 	getActivity,
 	getPortfolio,
 	getReceiveAddress,
+	getSilentPaymentScanStatus,
 	getState,
 	importAccount,
 	inspectTransfer,
+	listSilentPaymentLabels,
 	refreshPortfolio,
 	removeAccount,
 	removeWallet,
 	rename,
+	renameSilentPaymentLabel,
+	rescanSilentPayments,
 	revealRecoveryPhrase,
 	sendTransfer,
 	setSelected,

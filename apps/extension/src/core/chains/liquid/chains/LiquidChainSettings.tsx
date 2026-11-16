@@ -1,3 +1,9 @@
+import { SquareLock01Icon } from "@hugeicons/core-free-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
+import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+
+import { accountsClient } from "@/core/accounts/application/accounts-rpc/client";
 import { UiButton } from "@/ui/UiButton/base";
 import { UiCollapsible, UiCollapsibleContent, UiCollapsibleTrigger } from "@/ui/UiCollapsible";
 import { UiField, UiFieldDescription, UiFieldGroup, UiFieldLabel } from "@/ui/UiField";
@@ -5,6 +11,8 @@ import { UiInput } from "@/ui/UiInput/base";
 import { UiSwitch } from "@/ui/UiSwitch";
 import { UiTabs, UiTabsList, UiTabsTrigger } from "@/ui/UiTabs/base";
 
+import { LiquidScanStatusCard } from "../presentation/LiquidScanStatus";
+import { describeScanStatus } from "../presentation/scanStatusView";
 import {
 	LIQUID_CHAIN_BACKENDS,
 	LIQUID_NETWORK_KINDS,
@@ -13,6 +21,7 @@ import {
 	type LiquidChainSettings as LiquidChainSettingsModel,
 	type LiquidHttpHeader,
 } from "./LiquidChainRecord";
+import { SilentPaymentLabelsField } from "./SilentPaymentLabelsField";
 
 function parseIntInRange(value: string, min: number, max: number): number | undefined {
 	const trimmed = value.trim();
@@ -37,6 +46,21 @@ export function LiquidChainSettings({ chain, onChange }: LiquidChainSettingsProp
 	const headers = backend.headers ?? [];
 	const isCustom = settings.network === LIQUID_NETWORK_KINDS.REGTEST;
 
+	const [rescanHeight, setRescanHeight] = useState<string>("");
+	const [isRescanning, setIsRescanning] = useState(false);
+	const [feedbackMsg, setFeedbackMsg] = useState<{
+		text: string;
+		type: "error" | "success";
+	} | null>(null);
+
+	const { data: scanStatus, refetch: refetchScanStatus } = useQuery({
+		queryKey: ["silentPaymentScanStatus", chain.id],
+		queryFn: () => accountsClient.getSilentPaymentScanStatus({ chainId: chain.id }),
+		refetchInterval: 5000,
+	});
+	// The same words as the home screen, so the two never disagree.
+	const scanView = scanStatus ? describeScanStatus(scanStatus) : null;
+
 	const patchSettings = (patch: Partial<LiquidChainSettingsModel>) => {
 		onChange({ ...chain, settings: { ...settings, ...patch } });
 	};
@@ -49,12 +73,104 @@ export function LiquidChainSettings({ chain, onChange }: LiquidChainSettingsProp
 		patchBackend({ headers: next.length > 0 ? next : undefined });
 	};
 
+	const handleRescan = async () => {
+		const parsed = parseInt(rescanHeight.trim(), 10);
+		if (!Number.isFinite(parsed) || parsed < 0) {
+			setFeedbackMsg({ text: "Please enter a valid block height (>= 0)", type: "error" });
+			return;
+		}
+		try {
+			setIsRescanning(true);
+			setFeedbackMsg(null);
+			await accountsClient.rescanSilentPayments({
+				birthdayHeight: parsed,
+				chainId: chain.id,
+			});
+			setFeedbackMsg({ text: `Rescan scheduled from block #${parsed}`, type: "success" });
+			await refetchScanStatus();
+			setRescanHeight("");
+		} catch (err) {
+			setFeedbackMsg({
+				text: `Rescan failed: ${err instanceof Error ? err.message : String(err)}`,
+				type: "error",
+			});
+		} finally {
+			setIsRescanning(false);
+		}
+	};
+
 	const backendKind = backend.waterfalls
 		? LIQUID_CHAIN_BACKENDS.WATERFALLS
 		: LIQUID_CHAIN_BACKENDS.ESPLORA;
 
 	return (
 		<UiFieldGroup>
+			{/* Silent Payments Scanning Configuration Section */}
+			<div className="border-border/60 bg-muted/10 flex flex-col gap-4 rounded-xl border p-4">
+				<div className="flex items-center justify-between">
+					<div className="flex items-center gap-2">
+						<div className="bg-primary/10 text-primary flex size-7 items-center justify-center rounded-lg">
+							<HugeiconsIcon icon={SquareLock01Icon} size={16} />
+						</div>
+						<div>
+							<h3 className="text-sm font-semibold">Silent Payments (ELIP-352)</h3>
+							<p className="text-muted-foreground text-xs">
+								Scanned by this wallet; the scan key never leaves the device
+							</p>
+						</div>
+					</div>
+				</div>
+
+				<div className="flex flex-col gap-3.5 pt-1">
+					{scanView ? <LiquidScanStatusCard view={scanView} /> : null}
+
+					{/* Rescan from Height */}
+					<UiField>
+						<UiFieldLabel htmlFor="sp-rescan-height">Rescan from block height</UiFieldLabel>
+						<div className="flex items-center gap-2">
+							<UiInput
+								id="sp-rescan-height"
+								type="number"
+								min={0}
+								placeholder="e.g. 3400000"
+								value={rescanHeight}
+								onChange={(e) => setRescanHeight(e.target.value)}
+								className="font-mono text-xs"
+							/>
+							<UiButton
+								type="button"
+								size="sm"
+								variant="outline"
+								onClick={handleRescan}
+								disabled={isRescanning || !rescanHeight.trim()}
+							>
+								{isRescanning ? "Rescanning…" : "Rescan"}
+							</UiButton>
+						</div>
+						<UiFieldDescription>
+							Applies to the selected account on this network. New accounts scan from the current
+							block; for an imported wallet, rescan from the height of its first Silent Payment.
+						</UiFieldDescription>
+					</UiField>
+
+					<SilentPaymentLabelsField chainId={chain.id} />
+				</div>
+
+				{feedbackMsg && (
+					<div className="flex justify-end pt-1">
+						<span
+							className={
+								feedbackMsg.type === "error"
+									? "text-destructive text-xs"
+									: "text-xs font-medium text-emerald-500"
+							}
+						>
+							{feedbackMsg.text}
+						</span>
+					</div>
+				)}
+			</div>
+
 			{isCustom && (
 				<UiField>
 					<UiFieldLabel htmlFor="liquid-policy-asset">Policy asset (L-BTC)</UiFieldLabel>

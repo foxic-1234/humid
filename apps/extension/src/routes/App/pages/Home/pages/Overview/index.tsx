@@ -5,6 +5,7 @@ import { useHome } from "../../HomeContext";
 import { BalanceSummary } from "./components/BalanceSummary";
 import { HomeHeader } from "./components/HomeHeader";
 import { PortfolioRefresh } from "./components/PortfolioRefresh";
+import { ScanStatus } from "./components/ScanStatus";
 import { TokenList } from "./components/TokenList";
 
 export function OverviewPage() {
@@ -22,6 +23,7 @@ export function OverviewPage() {
 							native={portfolio.native}
 						/>
 						<PortfolioRefresh />
+						<ScanStatus />
 					</div>
 					<QuickActions />
 					<TokenList tokens={portfolio.tokens} />

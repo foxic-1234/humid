@@ -3,6 +3,8 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import { Link } from "@tanstack/react-router";
 import { type FormEvent, useState } from "react";
 
+import { WalletCreatedField } from "@/components/WalletCreatedField";
+import { walletCreatedAtFromMonth } from "@/core/key-manager/state/wallet-created-at";
 import { cn } from "@/theme/utils.ts";
 import { UiButton } from "@/ui/UiButton/base";
 import { UiInput } from "@/ui/UiInput/base";
@@ -16,7 +18,7 @@ type AddAccountViewProps = {
 	error: string | null;
 	isSubmitting: boolean;
 	onCreate: (input: { name?: string }) => void;
-	onImport: (input: { mnemonic: string; name?: string }) => void;
+	onImport: (input: { mnemonic: string; name?: string; walletCreatedAt?: number }) => void;
 };
 
 export function AddAccountView({
@@ -29,6 +31,7 @@ export function AddAccountView({
 	const [mode, setMode] = useState<Mode>("create");
 	const [name, setName] = useState("");
 	const [mnemonic, setMnemonic] = useState("");
+	const [createdMonth, setCreatedMonth] = useState("");
 
 	const trimmedName = name.trim();
 	const trimmedMnemonic = mnemonic.trim();
@@ -47,7 +50,11 @@ export function AddAccountView({
 
 		if (!trimmedMnemonic) return;
 
-		onImport({ mnemonic: trimmedMnemonic, name: namePayload });
+		onImport({
+			mnemonic: trimmedMnemonic,
+			name: namePayload,
+			walletCreatedAt: walletCreatedAtFromMonth(createdMonth),
+		});
 	};
 
 	return (
@@ -91,22 +98,30 @@ export function AddAccountView({
 					</div>
 
 					{mode === "import" ? (
-						<div className="flex flex-col gap-1.5">
-							<label className="text-sm font-medium" htmlFor="add-account-mnemonic">
-								Recovery phrase
-							</label>
-							<UiTextarea
-								className="font-mono"
-								id="add-account-mnemonic"
-								onChange={(event) => setMnemonic(event.target.value)}
-								placeholder="Enter your 12 or 24 word recovery phrase"
-								rows={3}
-								value={mnemonic}
+						<>
+							<div className="flex flex-col gap-1.5">
+								<label className="text-sm font-medium" htmlFor="add-account-mnemonic">
+									Recovery phrase
+								</label>
+								<UiTextarea
+									className="font-mono"
+									id="add-account-mnemonic"
+									onChange={(event) => setMnemonic(event.target.value)}
+									placeholder="Enter your 12 or 24 word recovery phrase"
+									rows={3}
+									value={mnemonic}
+								/>
+								<span className="text-muted-foreground text-xs">
+									The imported account is stored in this wallet.
+								</span>
+							</div>
+							<WalletCreatedField
+								disabled={isSubmitting}
+								id="add-account-wallet-created"
+								onChange={setCreatedMonth}
+								value={createdMonth}
 							/>
-							<span className="text-muted-foreground text-xs">
-								The imported account is stored in this wallet.
-							</span>
-						</div>
+						</>
 					) : (
 						<p className="text-muted-foreground text-sm leading-6">
 							Creates the next account on your current wallet&apos;s recovery phrase.

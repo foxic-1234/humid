@@ -86,6 +86,8 @@ function toActivity(entry: ActivityEntry): PortfolioViewActivity {
 		direction: entry.direction,
 		fee: parseBaseUnits(entry.feeSats),
 		id: entry.txid,
+		isSilentPayment: entry.isSilentPayment,
+		silentPaymentLabel: entry.silentPaymentLabel,
 		status: entry.timestamp === null ? "pending" : "confirmed",
 		timestamp: entry.timestamp,
 	};

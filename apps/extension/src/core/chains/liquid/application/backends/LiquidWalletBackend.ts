@@ -40,6 +40,10 @@ export type LiquidWalletAccount = {
 	implementation: unknown;
 	policyAssetId: LiquidAssetId;
 	rawPolicyAssetId: string;
+	silentPaymentAddress?: string;
+	silentPaymentKeys?: import("../../silent-payments/types").SilentPaymentRecipientKeys;
+	/** Securely zeroize in-memory private key material associated with this account. */
+	wipePrivateData?: () => void;
 };
 
 export type ResolveLiquidWalletAccountInput = {
@@ -53,8 +57,13 @@ export type ResolveLiquidWalletAccountInput = {
 
 export type LiquidActivityEntry = {
 	amountSats: string;
+	/** Height of the block that confirmed the transaction; absent while unconfirmed. */
+	blockHeight?: number;
 	direction: "received" | "sent";
 	feeSats: string;
+	isSilentPayment?: boolean;
+	/** Name of the user's label (m >= 1) a Silent Payment was received on. */
+	silentPaymentLabel?: string;
 	timestamp: number | null;
 	txid: string;
 };
@@ -89,6 +98,8 @@ export type LiquidUtxoSnapshot = {
 	derivationPath?: string;
 	rawAssetId: string;
 	scriptPubKey: string;
+	/** A Silent Payment output, merged in from the SP store rather than read by LWK. */
+	silentPayment?: true;
 	spendable: boolean;
 	txid: string;
 	txOut: string;
@@ -123,6 +134,14 @@ export type LiquidWalletBackend = {
 	) => { address: string; unconfidential: string };
 	getBalance: (account: LiquidWalletAccount, rawAssetId: string) => string;
 	getReceiveAddress: (account: LiquidWalletAccount) => { address: string; index: number };
+	/**
+	 * The wallet's static Silent Payment address (B_scan, B_spend).
+	 */
+	getSilentPaymentAddress?: (account: LiquidWalletAccount) => {
+		address: string;
+		scanPublicKey: string;
+		spendPublicKey: string;
+	};
 	getSigningAddress: (account: LiquidWalletAccount) => {
 		address: string;
 		index: number;

@@ -1,3 +1,5 @@
+import { bytesToHex } from "@noble/hashes/utils.js";
+
 import type { LiquidWalletAccount } from "../../../application/backends/LiquidWalletBackend";
 import { getLwkImplementation } from "./getLwkImplementation";
 
@@ -37,4 +39,24 @@ export function getWalletSigningAddress(account: LiquidWalletAccount): {
 		index: result.index(),
 		unconfidential: address.toUnconfidential().toString(),
 	};
+}
+
+/**
+ * The wallet's static Silent Payment address (B_scan, B_spend).
+ * Returns the base static SP address without labels.
+ */
+export function getWalletSilentPaymentAddress(account: LiquidWalletAccount): {
+	address: string;
+	scanPublicKey: string;
+	spendPublicKey: string;
+} {
+	if (account.silentPaymentAddress && account.silentPaymentKeys) {
+		return {
+			address: account.silentPaymentAddress,
+			scanPublicKey: bytesToHex(account.silentPaymentKeys.scanKey.publicKey),
+			spendPublicKey: bytesToHex(account.silentPaymentKeys.spendKey.publicKey),
+		};
+	}
+
+	throw new Error("Silent Payment keys are not initialized for this account");
 }

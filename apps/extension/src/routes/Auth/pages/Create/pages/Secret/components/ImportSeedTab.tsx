@@ -2,12 +2,18 @@ import { ClipboardPasteIcon, EraserIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useState } from "react";
 
+import { WalletCreatedField } from "@/components/WalletCreatedField";
+import { walletCreatedAtFromMonth } from "@/core/key-manager/state/wallet-created-at";
 import { UiButton } from "@/ui/UiButton/base";
 
 import { useMnemonicImport } from "../hooks/useMnemonicImport";
 import { MnemonicInputGrid } from "./MnemonicGrid";
 
-export function ImportSeedTab({ onComplete }: { onComplete: (mnemonic: string) => void }) {
+export function ImportSeedTab({
+	onComplete,
+}: {
+	onComplete: (mnemonic: string, walletCreatedAt?: number) => void;
+}) {
 	const {
 		clear,
 		getInputProps,
@@ -19,6 +25,7 @@ export function ImportSeedTab({ onComplete }: { onComplete: (mnemonic: string) =
 		words,
 	} = useMnemonicImport();
 	const [pasteHint, setPasteHint] = useState<string | null>(null);
+	const [createdMonth, setCreatedMonth] = useState("");
 
 	const handlePaste = async () => {
 		const result = await pasteFromClipboard();
@@ -69,7 +76,18 @@ export function ImportSeedTab({ onComplete }: { onComplete: (mnemonic: string) =
 				<p className="text-destructive text-center text-sm">This recovery phrase is invalid.</p>
 			)}
 
-			<UiButton type="button" size="lg" disabled={!isValid} onClick={() => onComplete(mnemonic)}>
+			<WalletCreatedField
+				id="import-seed-wallet-created"
+				onChange={setCreatedMonth}
+				value={createdMonth}
+			/>
+
+			<UiButton
+				type="button"
+				size="lg"
+				disabled={!isValid}
+				onClick={() => onComplete(mnemonic, walletCreatedAtFromMonth(createdMonth))}
+			>
 				Continue
 			</UiButton>
 		</div>

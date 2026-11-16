@@ -11,7 +11,7 @@ import type {
 } from "../../../domain/pset/types";
 import { parseLiquidSignPsetParams } from "../../../domain/pset/validation";
 import type { LiquidWalletAccount, LiquidWalletBackend } from "../../backends/LiquidWalletBackend";
-import { resolveDappAccount } from "../../dappAccountScope";
+import { resolveDappAccount, wipeReviewedAccount } from "../../dappAccountScope";
 
 export type LiquidSignPsetContext = WalletRpcBaseContext & {
 	chain: LiquidChainRecord;
@@ -82,6 +82,7 @@ export const signLiquidPset = createWalletMethod<
 		].join("\n\n"),
 		title: "Sign Liquid PSET?",
 	}),
+	dispose: wipeReviewedAccount,
 	execute: ({ context, params, review }) =>
 		context.walletBackend.signPset(review.account, {
 			broadcast: params.broadcast,
@@ -92,9 +93,15 @@ export const signLiquidPset = createWalletMethod<
 	parse: parseLiquidSignPsetParams,
 	review: async ({ context, params }) => {
 		const account = await resolveDappAccount(context);
-		await context.walletBackend.syncAccount(account);
-		const transaction = await context.walletBackend.blindAndInspectPset(account, params.pset);
-		return { account, transaction };
+		try {
+			await context.walletBackend.syncAccount(account);
+			const transaction = await context.walletBackend.blindAndInspectPset(account, params.pset);
+			return { account, transaction };
+		} catch (error) {
+			// No review comes back, so nothing would dispose of the account.
+			wipeReviewedAccount({ account });
+			throw error;
+		}
 	},
 });
 

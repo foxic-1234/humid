@@ -65,6 +65,14 @@ export async function resolveDappAccount(
 	});
 }
 
+/**
+ * `dispose` for a wallet method whose review holds the resolved account: wipes its private keys
+ * (Silent Payment scan and spend keys, account xprv) once the call has ended.
+ */
+export function wipeReviewedAccount({ account }: { account: LiquidWalletAccount }): void {
+	account.wipePrivateData?.();
+}
+
 export function resolveAccountGroupIdsForIdentifiers(
 	accountModel: AccountModelState,
 	chainId: ChainId,

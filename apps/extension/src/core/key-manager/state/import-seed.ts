@@ -6,6 +6,8 @@ export type AddImportedSeedInput = {
 	createdAt?: number;
 	name?: string;
 	seedMaterial: string;
+	/** When the user says the wallet was created (ms since epoch). */
+	walletCreatedAt?: number;
 };
 
 export function addImportedSeedToKeyManagerState(
@@ -24,6 +26,7 @@ export function addImportedSeedToKeyManagerState(
 		accountModel: state.accountModel,
 		createdAt: now,
 		name: input.name,
+		walletCreatedAt: input.walletCreatedAt,
 	});
 
 	return {

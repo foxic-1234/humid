@@ -10,7 +10,7 @@ import {
 } from "../../domain/LiquidRpc";
 import { parseLiquidGetAddressParams } from "../../domain/validation";
 import type { LiquidWalletAccount, LiquidWalletBackend } from "../backends/LiquidWalletBackend";
-import { resolveDappAccount } from "../dappAccountScope";
+import { resolveDappAccount, wipeReviewedAccount } from "../dappAccountScope";
 
 export type LiquidGetAddressContext = WalletRpcBaseContext & {
 	chain: LiquidChainRecord;
@@ -40,6 +40,7 @@ export const getLiquidAddress = createWalletMethod<
 		message: `A dapp wants to read the ${params.confidential ? "confidential" : "unconfidential"} Liquid address #${params.index} of this account.`,
 		title: "Share Liquid address?",
 	}),
+	dispose: wipeReviewedAccount,
 	execute: ({ context, params, review }) => {
 		const { account } = review;
 		const { address, unconfidential } = context.walletBackend.getAddress(account, params.index);

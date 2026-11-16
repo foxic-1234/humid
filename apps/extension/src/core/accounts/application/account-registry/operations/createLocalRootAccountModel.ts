@@ -11,6 +11,8 @@ export type CreateLocalRootAccountModelInput = {
 	keySourceId?: KeySourceId;
 	name?: string;
 	source?: "generated" | "imported";
+	/** For a restored wallet: when the user says it was created (ms since epoch). */
+	walletCreatedAt?: number;
 };
 
 export type CreateLocalRootAccountModelResult = {
@@ -55,7 +57,7 @@ export function createLocalRootAccountModel(
 						kind: "seed",
 						storage: "encrypted-vault",
 					},
-					metadata: { source },
+					metadata: keySourceMetadata(source, input.walletCreatedAt),
 					name: walletName,
 					updatedAt: now,
 				},
@@ -77,4 +79,14 @@ export function createLocalRootAccountModel(
 		},
 		keySourceId,
 	};
+}
+
+/** A generated seed is new: only a restored one carries the date the user gave for it. */
+export function keySourceMetadata(
+	source: "generated" | "imported",
+	walletCreatedAt: number | undefined,
+): Record<string, unknown> {
+	return source === "imported" && walletCreatedAt !== undefined && Number.isFinite(walletCreatedAt)
+		? { source, walletCreatedAt }
+		: { source };
 }

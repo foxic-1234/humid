@@ -38,3 +38,33 @@ export function getSeedMaterialForKeySource(
 
 	return secretMaterial.value;
 }
+
+/**
+ * Whether the wallet's seed was restored from a recovery phrase rather than generated here: a
+ * restored wallet may have received payments before this install.
+ */
+export function isRestoredKeySource(state: KeyManagerState, keySourceId?: KeySourceId): boolean {
+	const keySource = findKeySource(state, keySourceId);
+
+	return keySource?.kind === "imported-mnemonic" || keySource?.metadata?.source === "imported";
+}
+
+/**
+ * When the user says a restored wallet was created (ms since epoch), if they said: its first
+ * Silent Payments scan starts no later than that.
+ */
+export function getWalletCreatedAt(
+	state: KeyManagerState,
+	keySourceId?: KeySourceId,
+): number | undefined {
+	if (!isRestoredKeySource(state, keySourceId)) return undefined;
+	const value = findKeySource(state, keySourceId)?.metadata?.walletCreatedAt;
+
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function findKeySource(state: KeyManagerState, keySourceId?: KeySourceId) {
+	return keySourceId
+		? state.accountModel.keySources[keySourceId]
+		: Object.values(state.accountModel.keySources).find((record) => record.kind === "local-root");
+}

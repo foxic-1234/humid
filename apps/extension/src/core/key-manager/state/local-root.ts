@@ -19,6 +19,7 @@ export function createLocalRootKeyManagerState(
 		keySourceId: input.keySourceId,
 		name: input.name,
 		source: input.source,
+		walletCreatedAt: input.walletCreatedAt,
 	});
 
 	return {
