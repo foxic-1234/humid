@@ -20,6 +20,11 @@ export type CreateWalletMethodInput<
 	TResult,
 > = {
 	confirmation: ConfirmationPolicy<TParams, TContext, TReview>;
+	/**
+	 * Releases what `review` acquired (e.g. wipes an account's private keys) once the call ends:
+	 * after `execute`, a rejected confirmation, or any error past `review`.
+	 */
+	dispose?: (review: TReview) => void;
 	execute: (input: WalletMethodInput<TParams, TContext, TReview>) => Promise<TResult> | TResult;
 	id: string;
 	parse: (params: unknown) => TParams;
@@ -40,6 +45,7 @@ export function createWalletMethod<
 	TResult,
 >({
 	confirmation,
+	dispose,
 	execute,
 	id,
 	parse,
@@ -50,27 +56,31 @@ export function createWalletMethod<
 
 		const reviewed = await review({ context, params: parsedParams });
 
-		if (!context.authorization.isGranted(id)) {
-			if (!context.confirm) {
-				throw new WalletRpcResourceUnavailableError(
-					"Wallet method requires a confirmation surface.",
-					undefined,
-					WALLET_RPC_ERROR_REASONS.CONFIRMATION_UNAVAILABLE,
-				);
+		try {
+			if (!context.authorization.isGranted(id)) {
+				if (!context.confirm) {
+					throw new WalletRpcResourceUnavailableError(
+						"Wallet method requires a confirmation surface.",
+						undefined,
+						WALLET_RPC_ERROR_REASONS.CONFIRMATION_UNAVAILABLE,
+					);
+				}
+
+				const confirmed = await context.confirm({
+					...(await confirmation({ context, params: parsedParams, review: reviewed })),
+					method: id,
+					requester: context.requester,
+				});
+
+				if (!confirmed) {
+					throw new WalletRpcUserRejectedError();
+				}
 			}
 
-			const confirmed = await context.confirm({
-				...(await confirmation({ context, params: parsedParams, review: reviewed })),
-				method: id,
-				requester: context.requester,
-			});
-
-			if (!confirmed) {
-				throw new WalletRpcUserRejectedError();
-			}
+			return await execute({ context, params: parsedParams, review: reviewed });
+		} finally {
+			dispose?.(reviewed);
 		}
-
-		return execute({ context, params: parsedParams, review: reviewed });
 	};
 
 	return Object.assign(handler, { id });
