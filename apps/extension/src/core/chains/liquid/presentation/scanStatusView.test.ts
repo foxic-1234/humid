@@ -81,6 +81,23 @@ describe("describeScanStatus", () => {
 		expect(searching(0)).toBe("New payments show up right away. 405 of 70,688 blocks checked");
 	});
 
+	it("says why a history search is slow while a backup explorer is unreachable", () => {
+		expect(
+			describeScanStatus(
+				status({
+					etaSeconds: 674 * 3600,
+					fallbackExplorerDown: true,
+					history: { done: 1300, total: 111_847 },
+					isScanning: true,
+					newBlocksLeft: 0,
+					state: "backfilling",
+				}),
+			)?.detail,
+		).toBe(
+			"New payments show up right away. 1,300 of 111,847 blocks checked · about 674 h left A backup block explorer is unreachable from this network, so the search is much slower than usual.",
+		);
+	});
+
 	it("says a history search between runs continues shortly", () => {
 		expect(
 			describeScanStatus(

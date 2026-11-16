@@ -67,6 +67,8 @@ export type SilentPaymentBlockCursor = {
 export type SilentPaymentScanPhases = {
 	/** Seconds until the new blocks and the history are both scanned, at the recent rate. */
 	etaSeconds?: number;
+	/** A fallback explorer is passed over for failing: a long scan is far slower meanwhile. */
+	fallbackExplorerDown?: boolean;
 	/** A newest-first scan of older blocks, which runs after the newest ones are checked. */
 	history?: { done: number; total: number };
 	/** Blocks between the cursor and the chain tip still to check. */

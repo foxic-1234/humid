@@ -22,6 +22,8 @@ import { LIQUID_TESTNET_CHAIN_ID } from "../domain/LiquidChain";
 import { resetExplorerLimiterForTesting } from "./explorer";
 import {
 	augmentPortfolioWithSilentPayments,
+	buildExplorerApis,
+	fetchFromExplorer,
 	getSilentPaymentBirthday,
 	getSilentPaymentBackfill,
 	getSilentPaymentBlockCursor,
@@ -49,6 +51,7 @@ import {
 	startExplorerCatchUp,
 	syncFromExplorer,
 	updateSilentPaymentLabels,
+	usableExplorerApis,
 } from "./index";
 import {
 	fetchAllBlockTransactions,
@@ -122,6 +125,31 @@ describe("Autonomous Wallet Scanner (localScanner)", () => {
 		const progress = getSilentPaymentLocalScanProgress(chain.id, address);
 		expect(progress?.state).toBe("synced");
 		expect(progress?.currentHeight).toBe(100);
+	});
+
+	it("probes a fallback explorer that failed when a run starts, and uses it again once it answers", async () => {
+		const apis = buildExplorerApis(chain);
+		const fallback = apis.find((api) => api.startsWith("https://liquid.network"))!;
+		globalThis.fetch = (async () => {
+			throw new TypeError("fetch failed");
+		}) as unknown as typeof fetch;
+		await expect(fetchFromExplorer(`${fallback}/blocks/tip/height`)).rejects.toThrow();
+		expect(usableExplorerApis(apis)).not.toContain(fallback);
+
+		try {
+			setSystemTime(new Date(Date.now() + 61_000));
+			globalThis.fetch = fakeExplorer(110, {}, () => undefined);
+			await syncFromExplorer({
+				chain,
+				forceFromHeight: 109,
+				recipientKeys: keys,
+				silentPaymentAddress: address,
+			});
+		} finally {
+			setSystemTime();
+		}
+
+		expect(usableExplorerApis(apis)).toContain(fallback);
 	});
 
 	it("after a reorg, records payments and spends from the blocks that replaced theirs, without asking", async () => {

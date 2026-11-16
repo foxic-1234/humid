@@ -18,6 +18,7 @@ import type { LiquidChainRecord } from "../chains/LiquidChainRecord";
 import {
 	buildExplorerApis,
 	describeExplorerError,
+	fallbackExplorerUnreachable,
 	ExplorerBudgetError,
 	explorerBudgetSpent,
 	explorerRequestsStarted,
@@ -26,6 +27,7 @@ import {
 	fetchFromExplorer,
 	fetchWithRetryAndBackoff,
 	pickExplorerApi,
+	probeUnreachableExplorers,
 	restoreExplorerLimiters,
 	sessionArea,
 	sustainedExplorerRequestRate,
@@ -1284,6 +1286,7 @@ export async function syncFromExplorer(options: {
 			// another); a block listing asks a fallback only when the first usable one keeps failing.
 			const explorerApis = buildExplorerApis(chain);
 			await Promise.all([restoreExplorerLimiters(), restoreScanRates()]);
+			await probeUnreachableExplorers(explorerApis);
 			let explorerApi = pickExplorerApi(explorerApis);
 			const newlyDetectedUtxos: TrackedSilentPaymentUtxo[] = [];
 
@@ -1337,7 +1340,11 @@ export async function syncFromExplorer(options: {
 				setSilentPaymentLocalScanProgress(chain.id, silentPaymentAddress, {
 					chainId: chain.id,
 					currentHeight: 0,
-					errorMessage: describeExplorerError(err, "Block explorer is unreachable or offline"),
+					errorMessage: describeExplorerError(
+						err,
+						"Block explorer is unreachable or offline",
+						explorerApis,
+					),
 					isScanning: false,
 					percentage: 100,
 					state: "error",
@@ -1551,6 +1558,7 @@ export async function syncFromExplorer(options: {
 					currentHeight: Math.max(0, at),
 					errorMessage,
 					etaSeconds: state !== "synced" && rate && left > 0 ? Math.round(left / rate) : undefined,
+					fallbackExplorerDown: fallbackExplorerUnreachable(explorerApis) || undefined,
 					history,
 					isScanning: state === "backfilling",
 					newBlocksLeft,
@@ -1694,7 +1702,7 @@ export async function syncFromExplorer(options: {
 						// The next run scans them again.
 					}
 					scanHaltedDueToError = true;
-					updateProgress("error", describeExplorerError(err, "Failed to scan block"));
+					updateProgress("error", describeExplorerError(err, "Failed to scan block", explorerApis));
 					break;
 				}
 			}
@@ -1790,7 +1798,7 @@ export async function syncFromExplorer(options: {
 					updateProgress("backfilling");
 				} catch (err) {
 					scanHaltedDueToError = true;
-					updateProgress("error", describeExplorerError(err, "Failed to scan block"));
+					updateProgress("error", describeExplorerError(err, "Failed to scan block", explorerApis));
 					break;
 				}
 			}

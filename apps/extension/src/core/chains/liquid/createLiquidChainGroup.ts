@@ -12,8 +12,10 @@ import type { LiquidAccountRuntime, LiquidChainGroup } from "./contract";
 import {
 	mergeActivityWithSilentPayments,
 	augmentPortfolioWithSilentPayments,
+	buildExplorerApis,
 	countHeldSilentPaymentUtxos,
 	createSilentPaymentLabel,
+	fallbackExplorerUnreachable,
 	getSilentPaymentBackfill,
 	getSilentPaymentBirthday,
 	getSilentPaymentBlockCursor,
@@ -22,6 +24,7 @@ import {
 	getSilentPaymentScanRate,
 	renameSilentPaymentLabel,
 	rescanFromExplorer,
+	restoreExplorerLimiters,
 	type RestoredWallet,
 	type SilentPaymentLabel,
 	type SilentPaymentRecipientKeys,
@@ -210,6 +213,7 @@ export function createLiquidChainGroup(): LiquidChainGroup {
 							: progress;
 					}
 
+					await restoreExplorerLimiters();
 					const [cursor, birthday, backfill, rate] = await Promise.all([
 						getSilentPaymentBlockCursor(chainId, target.silentPaymentAddress),
 						getSilentPaymentBirthday(chainId, target.silentPaymentAddress),
@@ -231,6 +235,8 @@ export function createLiquidChainGroup(): LiquidChainGroup {
 							currentHeight: backfill.nextHeight,
 							// The last run's rate, so the time left shows before the next run measures one.
 							etaSeconds: rate && historyLeft > 0 ? Math.round(historyLeft / rate) : undefined,
+							fallbackExplorerDown:
+								fallbackExplorerUnreachable(buildExplorerApis(chain)) || undefined,
 							heldPayments: await heldPayments(),
 							history,
 							isScanning: false,

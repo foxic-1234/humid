@@ -58,12 +58,16 @@ export function describeScanStatus(status: SilentPaymentScanStatusResult): ScanS
 			held > 0
 				? `New payments show up right away; ${held.toLocaleString("en-US")} earlier ${held === 1 ? "payment returns" : "payments return"} to the balance once the search ends.`
 				: "New payments show up right away.";
+		// Hours turn into weeks without the fallback: say why, and that it is not the wallet's pace.
+		const slowed = status.fallbackExplorerDown
+			? " A backup block explorer is unreachable from this network, so the search is much slower than usual."
+			: "";
 		return {
 			// Between runs the last run's rate still gives the time left; without one, say it resumes.
 			detail:
-				status.isScanning || status.etaSeconds
+				(status.isScanning || status.etaSeconds
 					? withTimeLeft(`${lead} ${checked}`, status.etaSeconds)
-					: `${lead} ${checked} · continues shortly`,
+					: `${lead} ${checked} · continues shortly`) + slowed,
 			kind: "progress",
 			percent: Math.min(99, Math.floor((done / Math.max(1, total)) * 100)),
 			title: "Searching older payments",

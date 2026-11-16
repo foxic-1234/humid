@@ -72,8 +72,18 @@ const RATE_LIMITED_AVOID_MS = 5 * 60_000;
  * one happens on a healthy server too, and moving to a fallback that is down stalls the scan.
  */
 const FAILURES_BEFORE_AVOID = 3;
-/** How long a fallback that failed is passed over. */
+/** How long a fallback that failed is passed over, unless a probe finds it answering sooner. */
 const FALLBACK_FAILED_AVOID_MS = 30 * 60_000;
+/**
+ * A fallback passed over for failing is asked for the chain tip now and then, outside any scan:
+ * one that answers is used again at once, so a passing failure or a change of network costs a
+ * minute and not the half hour. The wait doubles with each probe left unanswered, and when a
+ * server a probe brought back fails again within `FALLBACK_RELAPSE_MS`.
+ */
+const FALLBACK_PROBE_INTERVAL_MS = 60_000;
+const MAX_FALLBACK_PROBE_INTERVAL_MS = 15 * 60_000;
+const FALLBACK_RELAPSE_MS = 10 * 60_000;
+const FALLBACK_PROBE_TIMEOUT_MS = 5000;
 /**
  * Request starts per second to one server: a run starts slow and, every `RATE_STEP_UP_MS` the
  * server keeps answering, doubles its rate until the first failure and speeds up by one after it,
@@ -142,6 +152,12 @@ type ExplorerLimiter = {
 	/** The next request may start at this time, at most `rate` a second. */
 	nextStartAt: number;
 	origin: string;
+	/** Passed over for failing: the next probe may go out at this time; 0 otherwise. */
+	probeAfter: number;
+	/** A probe brought the server back at this time; 0 if none did. */
+	probedBackAt: number;
+	/** The wait before the next probe. */
+	probeInterval: number;
 	queue: Array<() => void>;
 	rate: number;
 	/** Doubling the rate on each step up: until the server's first failure. */
@@ -168,7 +184,15 @@ const PERSISTED_RATE_TTL_MS = 30 * 60_000;
 
 type PersistedLimiter = Pick<
 	ExplorerLimiter,
-	"avoidUntil" | "budgetSpentUntil" | "cooldownUntil" | "rate" | "slowStart" | "spent"
+	| "avoidUntil"
+	| "budgetSpentUntil"
+	| "cooldownUntil"
+	| "probeAfter"
+	| "probedBackAt"
+	| "probeInterval"
+	| "rate"
+	| "slowStart"
+	| "spent"
 > & { savedAt: number };
 
 export type SessionArea = {
@@ -219,6 +243,9 @@ function persistLimiter(limiter: ExplorerLimiter): void {
 		avoidUntil: limiter.avoidUntil,
 		budgetSpentUntil: limiter.budgetSpentUntil,
 		cooldownUntil: limiter.cooldownUntil,
+		probeAfter: limiter.probeAfter,
+		probedBackAt: limiter.probedBackAt,
+		probeInterval: limiter.probeInterval,
 		rate: limiter.rate,
 		savedAt: Date.now(),
 		slowStart: limiter.slowStart,
@@ -252,6 +279,9 @@ function limiterFor(url: string): ExplorerLimiter {
 			lastRateChangeAt: Date.now(),
 			nextStartAt: 0,
 			origin,
+			probeAfter: 0,
+			probedBackAt: 0,
+			probeInterval: FALLBACK_PROBE_INTERVAL_MS,
 			queue: [],
 			rate: Math.min(fixedRate ?? INITIAL_EXPLORER_REQUESTS_PER_SECOND, ceiling),
 			slowStart: true,
@@ -264,6 +294,9 @@ function limiterFor(url: string): ExplorerLimiter {
 			limiter.avoidUntil = Number(saved.avoidUntil) || 0;
 			limiter.cooldownUntil = Number(saved.cooldownUntil) || 0;
 			limiter.budgetSpentUntil = Number(saved.budgetSpentUntil) || 0;
+			limiter.probeAfter = Number(saved.probeAfter) || 0;
+			limiter.probedBackAt = Number(saved.probedBackAt) || 0;
+			limiter.probeInterval = Number(saved.probeInterval) || FALLBACK_PROBE_INTERVAL_MS;
 			if (Array.isArray(saved.spent)) {
 				limiter.spent = saved.spent
 					.filter((entry) => Array.isArray(entry) && entry.length === 2)
@@ -408,11 +441,71 @@ function failed(limiter: ExplorerLimiter): void {
 	rateDown(limiter);
 	limiter.consecutiveFailures++;
 	if (FALLBACK_EXPLORER_ORIGINS.has(limiter.origin)) {
-		limiter.avoidUntil = Date.now() + FALLBACK_FAILED_AVOID_MS;
+		const now = Date.now();
+		// Requests in flight fail together: only the first of them sets the probe's wait.
+		if (limiter.probeAfter === 0) {
+			limiter.probeInterval =
+				now - limiter.probedBackAt < FALLBACK_RELAPSE_MS
+					? Math.min(limiter.probeInterval * 2, MAX_FALLBACK_PROBE_INTERVAL_MS)
+					: FALLBACK_PROBE_INTERVAL_MS;
+			limiter.probeAfter = now + limiter.probeInterval;
+		}
+		limiter.avoidUntil = now + FALLBACK_FAILED_AVOID_MS;
 	} else if (limiter.consecutiveFailures >= FAILURES_BEFORE_AVOID) {
 		limiter.avoidUntil = Date.now() + RATE_LIMITED_AVOID_MS;
 	}
 	persistLimiter(limiter);
+}
+
+/**
+ * Ask each fallback passed over for failing, whose probe is due, for the chain tip: one that
+ * answers is used again at once. A scan awaits this before it picks its explorers; the probe is
+ * outside the scan's requests, so a server still down costs the scan nothing but the wait.
+ */
+export async function probeUnreachableExplorers(apis: string[]): Promise<void> {
+	if (!limitersRestoredDone) await restoreLimiters();
+	await Promise.all(
+		apis.map(async (api) => {
+			const limiter = limiterFor(api);
+			const now = Date.now();
+			if (limiter.probeAfter === 0 || now < limiter.probeAfter || now >= limiter.avoidUntil) {
+				return;
+			}
+			// Before the answer: another run starting meanwhile sends no second probe.
+			limiter.probeAfter = now + limiter.probeInterval;
+			let answered = false;
+			try {
+				const res = await fetchWithTimeout(
+					`${api}/blocks/tip/height`,
+					undefined,
+					FALLBACK_PROBE_TIMEOUT_MS,
+				);
+				answered = res.ok && /^\d+$/.test((await res.text()).trim());
+			} catch {
+				// Still down.
+			}
+			if (answered) {
+				limiter.avoidUntil = 0;
+				limiter.consecutiveFailures = 0;
+				limiter.probeAfter = 0;
+				limiter.probedBackAt = Date.now();
+			} else {
+				limiter.probeInterval = Math.min(limiter.probeInterval * 2, MAX_FALLBACK_PROBE_INTERVAL_MS);
+				limiter.probeAfter = Date.now() + limiter.probeInterval;
+			}
+			persistLimiter(limiter);
+		}),
+	);
+}
+
+/** Whether a fallback of `apis` is passed over for failing: a long scan is then far slower. */
+export function fallbackExplorerUnreachable(apis: string[]): boolean {
+	const now = Date.now();
+	return apis.some((api) => {
+		const origin = new URL(api).origin;
+		const state = explorerLimiters.get(origin) ?? persistedLimiters[origin];
+		return state !== undefined && Number(state.probeAfter) > 0 && Number(state.avoidUntil) > now;
+	});
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -469,12 +562,15 @@ export async function fetchFromExplorer(
 				jitter();
 			limiter.cooldownUntil = Math.max(limiter.cooldownUntil, Date.now() + pause);
 			limiter.avoidUntil = Date.now() + Math.max(pause, RATE_LIMITED_AVOID_MS);
+			// It answers: this pause is the server's own, which no probe lifts.
+			limiter.probeAfter = 0;
 			persistLimiter(limiter);
 		} else if (res.status >= 500) {
 			failed(limiter);
 		} else {
 			limiter.consecutiveFailures = 0;
 			limiter.consecutiveRateLimits = 0;
+			limiter.probeAfter = 0;
 			rateUp(limiter);
 		}
 		return res;
@@ -648,9 +744,17 @@ export async function fetchTxHex(
 	}
 }
 
-/** A scan error as the status card shows it: a timeout or a failed connection in plain words. */
-export function describeExplorerError(error: unknown, fallback: string): string {
-	if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+/**
+ * A scan error as the status card shows it: a timeout or a failed connection in plain words. With
+ * the run's `apis`, a fallback that is down is named as such: the scan goes on without it.
+ */
+export function describeExplorerError(error: unknown, fallback: string, apis?: string[]): string {
+	const timedOut =
+		error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+	if ((timedOut || error instanceof TypeError) && apis && fallbackExplorerUnreachable(apis)) {
+		return "A backup block explorer is not answering; scanning continues through the main one, more slowly.";
+	}
+	if (timedOut) {
 		return "The block explorer did not answer in time; scanning resumes shortly.";
 	}
 	if (error instanceof TypeError) {

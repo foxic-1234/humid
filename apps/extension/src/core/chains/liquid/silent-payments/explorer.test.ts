@@ -4,9 +4,11 @@ import { createLiquidChainRecord } from "../chains/createBuiltInLiquidChains";
 import { LIQUID_TESTNET_CHAIN_ID } from "../domain/LiquidChain";
 import {
 	buildExplorerApis,
+	describeExplorerError,
 	explorerBudgetSpent,
 	explorerRateForTesting,
 	FALLBACK_EXPLORER_REQUESTS_PER_SECOND,
+	fallbackExplorerUnreachable,
 	fetchFromExplorer,
 	fetchWithRetryAndBackoff,
 	HOURLY_LIMIT_AVOID_MS,
@@ -14,6 +16,7 @@ import {
 	MAX_CONCURRENT_EXPLORER_REQUESTS,
 	MAX_EXPLORER_REQUESTS_PER_SECOND,
 	pickExplorerApi,
+	probeUnreachableExplorers,
 	resetExplorerLimiterForTesting,
 	restoreExplorerLimiters,
 	sustainedExplorerRequestRate,
@@ -154,6 +157,197 @@ describe("explorer choice", () => {
 		await fetchFromExplorer(`${apis[0]}/blocks/tip/height`);
 
 		expect(pickExplorerApi(apis)).toBe(apis[1]!);
+	});
+});
+
+describe("a fallback explorer that failed", () => {
+	const realFetch = globalThis.fetch;
+	const primary = "https://blockstream.info/liquidtestnet/api";
+	const fallback = "https://liquid.network/liquidtestnet/api";
+	const apis = [fallback, primary];
+	const MINUTE = 60_000;
+	/** What the fallback does: "down" drops the connection. */
+	let answer: "down" | number;
+	let probes = 0;
+
+	beforeEach(() => {
+		resetExplorerLimiterForTesting({ requestsPerSecond: Infinity });
+		answer = "down";
+		probes = 0;
+		globalThis.fetch = (async (input: string) => {
+			if (!input.startsWith(fallback)) return new Response("7", { status: 200 });
+			probes++;
+			if (answer === "down") throw new TypeError("fetch failed");
+			return new Response(answer === 200 ? "2707940" : "slow down", {
+				headers: answer === 429 ? { "Retry-After": "60" } : undefined,
+				status: answer,
+			});
+		}) as unknown as typeof fetch;
+	});
+
+	afterEach(() => {
+		globalThis.fetch = realFetch;
+		setSystemTime();
+		resetExplorerLimiterForTesting();
+	});
+
+	const later = (ms: number) => setSystemTime(new Date(Date.now() + ms));
+	const request = () => fetchFromExplorer(`${fallback}/blocks/tip/height`);
+	const failOnce = () => expect(request()).rejects.toThrow();
+
+	it("is used again as soon as a probe finds it answering", async () => {
+		await failOnce();
+		expect(pickExplorerApi(apis)).toBe(primary);
+		expect(fallbackExplorerUnreachable(apis)).toBe(true);
+
+		// Not before its wait: the server gets no request meanwhile.
+		probes = 0;
+		later(MINUTE - 1000);
+		await probeUnreachableExplorers(apis);
+		expect(probes).toBe(0);
+
+		answer = 200;
+		later(2000);
+		await probeUnreachableExplorers(apis);
+		expect(probes).toBe(1);
+		expect(pickExplorerApi(apis)).toBe(fallback);
+		expect(fallbackExplorerUnreachable(apis)).toBe(false);
+	});
+
+	it("is probed less and less often while it stays down", async () => {
+		await failOnce();
+		probes = 0;
+		const probeAfter = async (ms: number) => {
+			later(ms);
+			await probeUnreachableExplorers(apis);
+			return probes;
+		};
+
+		expect(await probeAfter(MINUTE + 1)).toBe(1);
+		// The wait doubled: two minutes from the probe that failed.
+		expect(await probeAfter(MINUTE + 1)).toBe(1);
+		expect(await probeAfter(MINUTE)).toBe(2);
+		expect(await probeAfter(3 * MINUTE)).toBe(2);
+		expect(await probeAfter(MINUTE + 1)).toBe(3);
+		expect(pickExplorerApi(apis)).toBe(primary);
+	});
+
+	it("sends one probe when several runs start together", async () => {
+		await failOnce();
+		probes = 0;
+		later(MINUTE + 1);
+
+		await Promise.all([probeUnreachableExplorers(apis), probeUnreachableExplorers(apis)]);
+
+		expect(probes).toBe(1);
+	});
+
+	it("waits longer for its probe when it fails again soon after one brought it back", async () => {
+		await failOnce();
+		answer = 200;
+		later(MINUTE + 1);
+		await probeUnreachableExplorers(apis);
+		expect(pickExplorerApi(apis)).toBe(fallback);
+
+		// It answers a probe and fails the scan: probing every minute would flap for hours.
+		answer = "down";
+		await failOnce();
+		probes = 0;
+		later(MINUTE + 1);
+		await probeUnreachableExplorers(apis);
+		expect(probes).toBe(0);
+		later(MINUTE);
+		await probeUnreachableExplorers(apis);
+		expect(probes).toBe(1);
+	});
+
+	it("takes the failures of requests in flight as one", async () => {
+		await Promise.all([failOnce(), failOnce(), failOnce()]);
+		probes = 0;
+		answer = 200;
+
+		later(MINUTE + 1);
+		await probeUnreachableExplorers(apis);
+
+		expect(probes).toBe(1);
+		expect(pickExplorerApi(apis)).toBe(fallback);
+	});
+
+	it("does not lift the pause of a server that answered 429", async () => {
+		answer = 429;
+		await request();
+		expect(pickExplorerApi(apis)).toBe(primary);
+		probes = 0;
+		answer = 200;
+
+		later(2 * MINUTE);
+		await probeUnreachableExplorers(apis);
+
+		expect(probes).toBe(0);
+		expect(pickExplorerApi(apis)).toBe(primary);
+		expect(fallbackExplorerUnreachable(apis)).toBe(false);
+	});
+
+	it("does not take a page that is not the chain tip for an answer", async () => {
+		await failOnce();
+		globalThis.fetch = (async () =>
+			new Response("<html>Sign in to this network</html>", {
+				status: 200,
+			})) as unknown as typeof fetch;
+
+		later(MINUTE + 1);
+		await probeUnreachableExplorers(apis);
+
+		expect(pickExplorerApi(apis)).toBe(primary);
+	});
+
+	it("is named in a scan error while it is down, and not otherwise", async () => {
+		const timeout = Object.assign(new Error("aborted"), { name: "AbortError" });
+		expect(describeExplorerError(timeout, "failed", apis)).toBe(
+			"The block explorer did not answer in time; scanning resumes shortly.",
+		);
+
+		await failOnce();
+
+		expect(describeExplorerError(timeout, "failed", apis)).toBe(
+			"A backup block explorer is not answering; scanning continues through the main one, more slowly.",
+		);
+		expect(describeExplorerError(new Error("Bad block"), "failed", apis)).toBe("Bad block");
+	});
+
+	describe("across service worker restarts", () => {
+		const scope = globalThis as { chrome?: unknown };
+
+		beforeEach(() => {
+			const session: Record<string, unknown> = {};
+			scope.chrome = {
+				storage: {
+					session: {
+						get: async (key: string) => ({ [key]: structuredClone(session[key]) }),
+						set: async (items: Record<string, unknown>) =>
+							Object.assign(session, structuredClone(items)),
+					},
+				},
+			};
+		});
+
+		afterEach(() => {
+			delete scope.chrome;
+		});
+
+		it("still probes it, and uses it once it answers", async () => {
+			await failOnce();
+			resetExplorerLimiterForTesting({ requestsPerSecond: Infinity });
+			await restoreExplorerLimiters();
+			expect(fallbackExplorerUnreachable(apis)).toBe(true);
+			expect(pickExplorerApi(apis)).toBe(primary);
+
+			answer = 200;
+			later(MINUTE + 1);
+			await probeUnreachableExplorers(apis);
+
+			expect(pickExplorerApi(apis)).toBe(fallback);
+		});
 	});
 });
 

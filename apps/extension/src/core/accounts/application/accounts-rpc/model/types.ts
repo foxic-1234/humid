@@ -145,6 +145,8 @@ export type SilentPaymentScanStatusResult = {
 	errorMessage?: string;
 	/** Wallet scanning: seconds until the new blocks and the history are scanned, if known. */
 	etaSeconds?: number;
+	/** Wallet scanning: a fallback explorer does not answer, so a long scan is far slower. */
+	fallbackExplorerDown?: boolean;
 	/**
 	 * Wallet scanning, while `history` is left: payments kept out of the balance until the history
 	 * is scanned, as it may hold their spend.
