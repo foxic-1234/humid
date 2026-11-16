@@ -14,7 +14,6 @@ import {
 	markSilentPaymentUtxoSpent,
 	mergeActivityWithSilentPayments,
 	rollBackSilentPaymentBlocks,
-	rollBackSilentPaymentUtxo,
 	saveSilentPaymentBirthday,
 	saveTrackedSilentPaymentUtxo,
 	setSpStoreVaultForTesting,
@@ -207,63 +206,6 @@ describe("silent-payments store & persistence", () => {
 			expect(other?.blindingKeyHex).toBe("44".repeat(32));
 		});
 
-		it("a reorged-out spend makes the output unspent again", async () => {
-			await saveTrackedSilentPaymentUtxo(spUtxo());
-			await markSilentPaymentUtxoSpent("a".repeat(64), 0, "c".repeat(64));
-
-			const changed = await rollBackSilentPaymentUtxo("a".repeat(64), 0, {
-				fundingConfirmed: true,
-				spent: false,
-			});
-
-			const tracked = await findTracked("a".repeat(64));
-			expect(changed).toBe(true);
-			expect(tracked?.spent).toBe(false);
-			expect(tracked?.spentInTxid).toBeUndefined();
-			expect(tracked?.confirmed).toBe(true);
-		});
-
-		it("a reorged-out funding tx reverts the output's confirmation", async () => {
-			await saveTrackedSilentPaymentUtxo(spUtxo({ blockTime: 1_700_000_000 }));
-
-			await rollBackSilentPaymentUtxo("a".repeat(64), 0, { fundingConfirmed: false, spent: false });
-
-			const tracked = await findTracked("a".repeat(64));
-			expect(tracked?.confirmed).toBe(false);
-			expect(tracked?.blockTime).toBeNull();
-			expect(tracked?.spent).toBe(false);
-		});
-
-		it("a reorged-out funding tx of a spent output reverts the confirmation and keeps the spend", async () => {
-			await saveTrackedSilentPaymentUtxo(spUtxo({ blockTime: 1_700_000_000 }));
-			await markSilentPaymentUtxoSpent("a".repeat(64), 0, "c".repeat(64));
-
-			// The spending tx went back to the mempool together with the funding tx.
-			await rollBackSilentPaymentUtxo("a".repeat(64), 0, { fundingConfirmed: false, spent: true });
-
-			const tracked = await findTracked("a".repeat(64));
-			expect(tracked?.confirmed).toBe(false);
-			expect(tracked?.blockTime).toBeNull();
-			expect(tracked?.spent).toBe(true);
-			expect(tracked?.spentInTxid).toBe("c".repeat(64));
-		});
-
-		it("a reorg the explorer does not confirm changes nothing", async () => {
-			await saveTrackedSilentPaymentUtxo(spUtxo({ blockTime: 1_700_000_000 }));
-
-			const changed = await rollBackSilentPaymentUtxo("a".repeat(64), 0, {
-				fundingConfirmed: true,
-				spent: false,
-			});
-
-			expect(changed).toBe(false);
-			expect(await findTracked("a".repeat(64))).toMatchObject({
-				blockTime: 1_700_000_000,
-				confirmed: true,
-				spent: false,
-			});
-		});
-
 		it("undoes what replaced blocks recorded, without un-spending anything", async () => {
 			const t = (c: string) => c.repeat(64);
 			await saveTrackedSilentPaymentUtxo(
@@ -277,9 +219,8 @@ describe("silent-payments store & persistence", () => {
 				blockTime: 1_700_000_101,
 				confirmed: true,
 			});
-			// Below the replaced blocks, and a record from before heights were kept.
+			// Below the replaced blocks.
 			await saveTrackedSilentPaymentUtxo(spUtxo({ blockHeight: 80, txid: t("d") }));
-			await saveTrackedSilentPaymentUtxo(spUtxo({ blockTime: 1_700_000_100, txid: t("e") }));
 			await saveTrackedSilentPaymentUtxo(spUtxo({ blockHeight: 100, txid: t("f") }));
 
 			const changed = await rollBackSilentPaymentBlocks(CHAIN_ID, SP_ADDRESS, 95);
@@ -295,7 +236,6 @@ describe("silent-payments store & persistence", () => {
 			expect(spend?.spentBlockHeight).toBeUndefined();
 			expect(spend?.spentSeenAt).toBeNumber();
 			expect(await findTracked(t("d"))).toMatchObject({ blockHeight: 80, confirmed: true });
-			expect(await findTracked(t("e"))).toMatchObject({ confirmed: true });
 			expect(await getUnspentSilentPaymentUtxos(CHAIN_ID, SP_ADDRESS)).not.toContainEqual(
 				expect.objectContaining({ txid: t("b") }),
 			);
@@ -407,21 +347,6 @@ describe("silent-payments store & persistence", () => {
 
 				expect(firstSeen).toBeNumber();
 				expect((await findTracked("a".repeat(64)))?.spentSeenAt).toBe(firstSeen!);
-			});
-
-			it("a reorg rollback clears the deadline with the spend", async () => {
-				await saveTrackedSilentPaymentUtxo(spUtxo());
-				await markSilentPaymentUtxoSpent("a".repeat(64), 0, "c".repeat(64), {
-					blockTime: null,
-					confirmed: false,
-				});
-
-				await rollBackSilentPaymentUtxo("a".repeat(64), 0, {
-					fundingConfirmed: true,
-					spent: false,
-				});
-
-				expect((await findTracked("a".repeat(64)))?.spentSeenAt).toBeUndefined();
 			});
 		});
 	});

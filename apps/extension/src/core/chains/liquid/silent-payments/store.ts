@@ -6,8 +6,8 @@ export type TrackedSilentPaymentUtxo = {
 	assetBlindingFactorHex?: string;
 	blindingKeyHex?: string; // bk_k hex (ELIP-352)
 	/**
-	 * Height of the block that mined it; absent while unconfirmed and on records made before heights
-	 * were kept. A reorg rolls back what was recorded from the blocks it replaces.
+	 * Height of the block that mined it; absent while unconfirmed. A reorg rolls back what was
+	 * recorded from the blocks it replaces.
 	 */
 	blockHeight?: number;
 	blockTime?: number | null;
@@ -22,7 +22,7 @@ export type TrackedSilentPaymentUtxo = {
 	scriptPubKeyHex: string;
 	scriptType?: "p2tr";
 	spent: boolean;
-	/** Height of the block that mined the spend; absent as for `blockHeight`. */
+	/** Height of the block that mined the spend; absent while the spend is unconfirmed. */
 	spentBlockHeight?: number;
 	/** Block time of the spending transaction; null or absent while it is unconfirmed. */
 	spentBlockTime?: number | null;
@@ -181,7 +181,7 @@ async function readTrackedListForWrite(): Promise<TrackedSilentPaymentUtxo[]> {
 
 /**
  * Insert or update a tracked UTXO. An update never un-spends or un-confirms a record (events may be
- * replayed after a rescan); reorg rollbacks go through `rollBackSilentPaymentUtxo`.
+ * replayed after a rescan); reorg rollbacks go through `rollBackSilentPaymentBlocks`.
  */
 export async function saveTrackedSilentPaymentUtxo(utxo: TrackedSilentPaymentUtxo): Promise<void> {
 	return withStoreLock(async () => {
@@ -376,38 +376,6 @@ export async function forgetSilentPaymentUtxo(txid: string, outputIndex: number)
 }
 
 /**
- * Roll back a reorg to the state the explorer reports: an unconfirmed funding tx reverts the
- * output's confirmation, an output nothing spends any more becomes unspent. A `reorged` event
- * covers either case (the funding block or the spending block was reorganized out), so the record's
- * own flags cannot tell which one happened. Returns whether the record changed.
- */
-export async function rollBackSilentPaymentUtxo(
-	txid: string,
-	outputIndex: number,
-	explorer: { fundingConfirmed: boolean; spent: boolean },
-): Promise<boolean> {
-	let changed = false;
-	await updateTrackedSilentPaymentUtxo(txid, outputIndex, (target) => {
-		if (!explorer.fundingConfirmed && target.confirmed) {
-			target.confirmed = false;
-			target.blockTime = null;
-			delete target.blockHeight;
-			changed = true;
-		}
-		if (!explorer.spent && target.spent) {
-			target.spent = false;
-			target.spentInTxid = undefined;
-			target.spentBlockTime = undefined;
-			delete target.spentBlockHeight;
-			target.spentFeeSats = undefined;
-			delete target.spentSeenAt;
-			changed = true;
-		}
-	});
-	return changed;
-}
-
-/**
  * A tracked UTXO can be spent if it is unspent, was unblinded, and carries its spending tweak tk.
  * `assetFilter` narrows the result to the native asset (any of `policyAssetIds`) or one asset.
  */
@@ -546,18 +514,16 @@ export async function saveSilentPaymentBackfill(
  * index outgrew its cap and was dropped; checks then ask the explorer.
  */
 export type SilentPaymentSpentIndex = {
-	/** The block height comes last: an index stored before it was kept has none. */
 	entries: Record<
 		string,
-		[spentInTxid: string, blockTime: number | null, feeSats: string | null, blockHeight?: number]
+		[spentInTxid: string, blockTime: number | null, feeSats: string | null, blockHeight: number]
 	>;
 	overflow?: true;
 	/**
 	 * Hex key of the fingerprints, made with the index and kept only in the vault, so nobody can
-	 * craft a spend whose fingerprint matches one of the wallet's outputs. An index stored before
-	 * it was kept has none and uses plain hashes.
+	 * craft a spend whose fingerprint matches one of the wallet's outputs.
 	 */
-	salt?: string;
+	salt: string;
 };
 
 function buildSpentIndexKey(chainId: string, silentPaymentAddress: string): string {
@@ -571,7 +537,13 @@ export async function getSilentPaymentSpentIndex(
 	const val = await storeGetItem<SilentPaymentSpentIndex>(
 		buildSpentIndexKey(chainId, silentPaymentAddress),
 	);
-	return val && typeof val.entries === "object" && val.entries !== null ? val : null;
+	// Without a salt its fingerprints could be ground: checks then ask the explorer instead.
+	return val &&
+		typeof val.entries === "object" &&
+		val.entries !== null &&
+		typeof val.salt === "string"
+		? val
+		: null;
 }
 
 export async function saveSilentPaymentSpentIndex(

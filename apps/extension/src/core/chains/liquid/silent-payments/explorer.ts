@@ -648,43 +648,6 @@ export async function fetchTxHex(
 	}
 }
 
-export type ExplorerTxStatus = {
-	block_height?: number;
-	block_time?: number;
-	confirmed: boolean;
-};
-
-/**
- * A transaction's confirmation status as the explorer sees it.
- * `confirmed: false` does not prove the transaction exists (see `fetchTxHex`).
- * Returns null when the explorer gave no usable answer.
- */
-export async function fetchTxStatus(
-	explorerApi: string,
-	txid: string,
-): Promise<ExplorerTxStatus | null> {
-	try {
-		const res = await fetchFromExplorer(`${explorerApi}/tx/${txid}/status`);
-		if (res.status === 404) {
-			return { confirmed: false };
-		}
-		if (!res.ok) return null;
-		const body = (await res.json()) as {
-			block_height?: unknown;
-			block_time?: unknown;
-			confirmed?: unknown;
-		};
-		if (typeof body?.confirmed !== "boolean") return null;
-		return {
-			block_height: typeof body.block_height === "number" ? body.block_height : undefined,
-			block_time: typeof body.block_time === "number" ? body.block_time : undefined,
-			confirmed: body.confirmed,
-		};
-	} catch {
-		return null;
-	}
-}
-
 /** A scan error as the status card shows it: a timeout or a failed connection in plain words. */
 export function describeExplorerError(error: unknown, fallback: string): string {
 	if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {

@@ -48,7 +48,6 @@ import {
 	SP_STORAGE_KEY,
 	startExplorerCatchUp,
 	syncFromExplorer,
-	type TrackedSilentPaymentUtxo,
 	updateSilentPaymentLabels,
 } from "./index";
 import {
@@ -67,6 +66,7 @@ import {
 	PAYMENT_SATS,
 	spendOf,
 } from "./localScannerTestChain";
+import type { SilentPaymentSpentIndex } from "./store";
 import { useMemorySpStore } from "./storeTestStorage";
 import type { SilentPaymentRecipientKeys } from "./types";
 
@@ -172,52 +172,6 @@ describe("Autonomous Wallet Scanner (localScanner)", () => {
 			confirmed: true,
 		});
 		expect(requests.filter((p) => p.includes("/outspend/") || p.includes("/tx/"))).toEqual([]);
-	});
-
-	it("after a reorg, asks only about records without heights from around the replaced blocks", async () => {
-		const legacy = (txid: string, blockTime: number): TrackedSilentPaymentUtxo => ({
-			address: "tex1plegacy",
-			amountSats: "1000",
-			blockTime,
-			chainId: chain.id,
-			confirmed: true,
-			createdAt: Date.now(),
-			outputIndex: 0,
-			rawAssetId: "aa".repeat(32),
-			recipientAddress: address,
-			scriptPubKeyHex: "5120" + "33".repeat(32),
-			spent: false,
-			txid,
-		});
-		const recent = "71".repeat(32);
-		const old = "72".repeat(32);
-		await saveTrackedSilentPaymentUtxo(legacy(recent, 1_700_000_000 + 105 * 60));
-		await saveTrackedSilentPaymentUtxo(legacy(old, 1_700_000_000 - 2 * 24 * 60 * 60));
-		// A cursor on a block the explorer no longer has at that height.
-		await saveSilentPaymentBlockCursor(chain.id, address, {
-			blockHash: "ab".repeat(32),
-			height: 110,
-		});
-		const requests: string[] = [];
-		globalThis.fetch = fakeExplorer(
-			111,
-			{},
-			(path) =>
-				path.endsWith("/status")
-					? new Response(JSON.stringify({ confirmed: true }), { status: 200 })
-					: undefined,
-			requests,
-		);
-
-		await syncFromExplorer({ chain, recipientKeys: keys, silentPaymentAddress: address });
-
-		expect(
-			requests
-				.filter((p) => p.includes(recent))
-				.map((p) => p.slice(p.indexOf("/tx/")))
-				.toSorted(),
-		).toEqual([`/tx/${recent}/outspend/0`, `/tx/${recent}/status`]);
-		expect(requests.filter((p) => p.includes(old))).toEqual([]);
 	});
 
 	it("reports a catch-up from the cursor, not from the wallet's birthday", async () => {
@@ -865,7 +819,7 @@ describe("Autonomous Wallet Scanner (localScanner)", () => {
 			expect(byTxid.get(kept)).toMatchObject({ spent: true, spentBlockHeight: 1985 });
 		});
 
-		it("asks the explorer for a backfill started before the spent index existed", async () => {
+		it("asks the explorer for a backfill without a spent index", async () => {
 			let answer = false;
 			globalThis.fetch = withChain((path) =>
 				path.includes("/outspend/") && !answer ? new Response("busy", { status: 503 }) : undefined,
@@ -890,6 +844,83 @@ describe("Autonomous Wallet Scanner (localScanner)", () => {
 			expect((await getUnspentSilentPaymentUtxos(chain.id, address)).map((u) => u.txid)).toEqual([
 				recent.validTx.txid,
 			]);
+		});
+
+		it("asks the explorer when the stored spent index has no salt", async () => {
+			const spend = spendOf(recent.validTx.txid, recent.esploraTx.vout[0]!.scriptpubkey);
+			const spendTxid = (spend.json as { txid: string }).txid;
+			const requests: string[] = [];
+			globalThis.fetch = withChain(() => undefined, baseChain, requests);
+			await saveSilentPaymentBlockCursor(chain.id, address, {
+				blockHash: blockHash(2000),
+				height: 2000,
+			});
+			await saveSilentPaymentBackfill(chain.id, address, {
+				nextHash: blockHash(2000),
+				nextHeight: 2000,
+				stopHeight: 100,
+				topHeight: 2000,
+			});
+			// Keyed by a plain hash, which a payer of the output could grind a spend to match.
+			const plainKey = bytesToHex(
+				sha256(new TextEncoder().encode(`${recent.validTx.txid}:0`)).subarray(0, 8),
+			);
+			await saveSilentPaymentSpentIndex(chain.id, address, {
+				entries: { [plainKey]: [spendTxid, 1_700_000_000, null, 1998] },
+			} as unknown as SilentPaymentSpentIndex);
+
+			await run();
+
+			expect(await getTrackedSilentPaymentUtxos()).toMatchObject([
+				{ spent: false, txid: recent.validTx.txid },
+			]);
+			expect(requests.some((p) => p.endsWith(`/tx/${recent.validTx.txid}/outspend/0`))).toBe(true);
+		});
+
+		it("keeps a spend unsettled while the explorer gives its block no height", async () => {
+			const spendTxid = "e1".repeat(32);
+			let withHeight = false;
+			globalThis.fetch = withChain((path) => {
+				if (path.includes("/outspend/")) {
+					return new Response(JSON.stringify({ spent: true, txid: spendTxid, vin: 0 }), {
+						status: 200,
+					});
+				}
+				if (path.endsWith(`/tx/${spendTxid}`)) {
+					const status = withHeight
+						? { block_height: 1999, block_time: 1_700_000_000 + 1999 * 60, confirmed: true }
+						: { block_time: 1_700_000_000 + 1999 * 60, confirmed: true };
+					return new Response(JSON.stringify({ fee: 30, status, txid: spendTxid }), {
+						status: 200,
+					});
+				}
+				return undefined;
+			});
+			await saveSilentPaymentBlockCursor(chain.id, address, {
+				blockHash: blockHash(2000),
+				height: 2000,
+			});
+			await saveSilentPaymentBackfill(chain.id, address, {
+				nextHash: blockHash(2000),
+				nextHeight: 2000,
+				stopHeight: 100,
+				topHeight: 2000,
+			});
+
+			await run();
+			const [unsettled] = await getTrackedSilentPaymentUtxos();
+			expect(unsettled).toMatchObject({ spendUnverified: true, spent: false });
+			expect(await getUnspentSilentPaymentUtxos(chain.id, address)).toEqual([]);
+
+			withHeight = true;
+			await run();
+			const [settled] = await getTrackedSilentPaymentUtxos();
+			expect(settled).toMatchObject({
+				spent: true,
+				spentBlockHeight: 1999,
+				spentInTxid: spendTxid,
+			});
+			expect(settled!.spendUnverified).toBeUndefined();
 		});
 
 		it("keeps an old unconfirmed spend while older blocks are left to scan", async () => {
@@ -1786,14 +1817,10 @@ describe("spentOutpointFingerprint", () => {
 
 	it("depends on the index's salt, so it cannot be predicted without it", () => {
 		expect(salted("01".repeat(32))).not.toBe(salted("02".repeat(32)));
-		expect(salted("01".repeat(32))).not.toBe(spentOutpointFingerprint({}, txid, 1));
-		expect(salted("01".repeat(32))).toMatch(/^[0-9a-f]{16}$/);
-	});
-
-	it("keeps the plain hash for an index stored before salts", () => {
-		expect(spentOutpointFingerprint({}, txid, 1)).toBe(
+		expect(salted("01".repeat(32))).not.toBe(
 			bytesToHex(sha256(new TextEncoder().encode(`${txid}:1`)).subarray(0, 8)),
 		);
+		expect(salted("01".repeat(32))).toMatch(/^[0-9a-f]{16}$/);
 	});
 
 	it("is the same for an outpoint however its txid is cased", () => {

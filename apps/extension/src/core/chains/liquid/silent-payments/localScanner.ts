@@ -23,7 +23,6 @@ import {
 	explorerRequestsStarted,
 	fetchOutspend,
 	fetchTxHex,
-	fetchTxStatus,
 	fetchFromExplorer,
 	fetchWithRetryAndBackoff,
 	pickExplorerApi,
@@ -49,7 +48,6 @@ import {
 	markSilentPaymentSpendsUnverified,
 	markSilentPaymentUtxoSpent,
 	rollBackSilentPaymentBlocks,
-	rollBackSilentPaymentUtxo,
 	saveSilentPaymentBackfill,
 	saveSilentPaymentBirthday,
 	saveSilentPaymentBlockCursor,
@@ -91,12 +89,6 @@ export const BACKFILL_THRESHOLD_BLOCKS = 24 * 60;
  * are final after two confirmations, so a reorg never goes deeper.
  */
 const BACKFILL_REWIND_BLOCKS = 10;
-/**
- * After a reorg, records made before block heights were kept are asked about one by one when their
- * block time is no older than the first rescanned block's by this margin: block times need not
- * rise strictly, so the margin keeps a record of a replaced block from slipping through.
- */
-const REORG_LEGACY_TIME_MARGIN_SECONDS = 24 * 60 * 60;
 /** Rewinds a run allows before it halts: an explorer that keeps switching chains is not followed. */
 const MAX_BACKFILL_REWINDS_PER_RUN = 3;
 /** Esplora's `/blocks/:height` returns this many headers, newest first. */
@@ -683,9 +675,7 @@ export function spentOutpointFingerprint(
 	vout: number,
 ): string {
 	const message = utf8ToBytes(outpointKey(txid, vout));
-	const digest = index.salt ? hmac(sha256, hexToBytes(index.salt), message) : sha256(message);
-
-	return bytesToHex(digest.subarray(0, 8));
+	return bytesToHex(hmac(sha256, hexToBytes(index.salt), message).subarray(0, 8));
 }
 
 /**
@@ -742,7 +732,7 @@ function dropIndexedSpends(
 ): boolean {
 	let changed = false;
 	for (const [key, [, , , height]] of Object.entries(index.entries)) {
-		if (height !== undefined && height >= fromHeight && height <= toHeight) {
+		if (height >= fromHeight && height <= toHeight) {
 			delete index.entries[key];
 			changed = true;
 		}
@@ -753,7 +743,7 @@ function dropIndexedSpends(
 /**
  * Settle whether outputs waiting on a spend check were spent, from the spent index: every block
  * after them has been scanned into it, so no request names an output. Without a usable index (it
- * overflowed, or the backfill predates it) the explorer is asked, as `verifySpends` does.
+ * overflowed, or there is none) the explorer is asked, as `verifySpends` does.
  */
 async function checkSpends(ctx: ScanContext, outputs: TrackedSilentPaymentUtxo[]): Promise<void> {
 	const index = ctx.spentIndex;
@@ -918,11 +908,10 @@ async function fetchSpendDetails(
 			status?: { block_height?: number; block_time?: number; confirmed?: boolean };
 		};
 		if (typeof tx.status?.confirmed !== "boolean") return undefined;
+		// A mined spend without its height could not be rolled back by a reorg of its block.
+		if (tx.status.confirmed && typeof tx.status.block_height !== "number") return undefined;
 		return {
-			blockHeight:
-				tx.status.confirmed && typeof tx.status.block_height === "number"
-					? tx.status.block_height
-					: undefined,
+			blockHeight: tx.status.confirmed ? tx.status.block_height : undefined,
 			blockTime: tx.status.confirmed ? (tx.status.block_time ?? null) : null,
 			confirmed: tx.status.confirmed,
 			feeSats: typeof tx.fee === "number" ? String(tx.fee) : undefined,
@@ -948,9 +937,10 @@ async function verifySpends(ctx: ScanContext, outputs: TrackedSilentPaymentUtxo[
 			continue;
 		}
 		const spend = outspend.txid ? await fetchSpendDetails(api, outspend.txid) : undefined;
+		if (!spend) continue;
 		await markSilentPaymentUtxoSpent(u.txid, u.outputIndex, outspend.txid, spend);
 		// An unconfirmed spend stays watched: the block that confirms it may come in this run.
-		if (spend?.confirmed !== false) ctx.unspent.delete(outpointKey(u.txid, u.outputIndex));
+		if (spend.confirmed) ctx.unspent.delete(outpointKey(u.txid, u.outputIndex));
 	}
 }
 
@@ -1111,29 +1101,21 @@ async function scanMempoolFromExplorer({
  *   mempool, and if it is mined after all, scanning its block finds the output again;
  * - make an output unspent again when its unconfirmed spend was not mined for as long: the spend
  *   left the mempool (or the explorer listed one that never existed), and if it is mined after
- *   all, scanning its block marks the output spent again;
- * - after a reorg, records made before block heights were kept, from around the replaced blocks:
- *   roll back confirmations and spends the explorer no longer reports. Records with heights were
- *   rolled back before the scan, which confirmed again what the new blocks hold.
+ *   all, scanning its block marks the output spent again.
+ * A reorg needs no request either: what the replaced blocks recorded was rolled back before the
+ * scan, which confirmed again what the new blocks hold.
  */
 async function reconcileTrackedUtxos({
 	caughtUp,
 	chainId,
-	explorerApi,
 	fullyScanned,
-	legacyReorgSince,
-	reorgDetected,
 	silentPaymentAddress,
 }: {
 	/** The cursor reached the tip, so any mined transaction's block has been scanned. */
 	caughtUp: boolean;
 	chainId: string;
-	explorerApi: string;
 	/** Caught up and no backfill left: every block since any recorded spend has been scanned. */
 	fullyScanned: boolean;
-	/** Block time from which records without heights may lie in replaced blocks; unknown: all. */
-	legacyReorgSince?: number;
-	reorgDetected: boolean;
 	silentPaymentAddress: string;
 }): Promise<void> {
 	const owner = silentPaymentAddress.toLowerCase();
@@ -1150,27 +1132,6 @@ async function reconcileTrackedUtxos({
 		}
 		if (fullyScanned && u.spent && u.spentBlockTime == null && u.spentSeenAt !== undefined) {
 			await expireUnconfirmedSilentPaymentSpend(u.txid, u.outputIndex, expiredBefore);
-		}
-
-		const since = (time: number | null | undefined) =>
-			legacyReorgSince === undefined || time == null || time >= legacyReorgSince;
-		const legacyFunding = u.confirmed && u.blockHeight === undefined && since(u.blockTime);
-		const legacySpend =
-			u.spent &&
-			u.spentBlockTime != null &&
-			u.spentBlockHeight === undefined &&
-			since(u.spentBlockTime);
-		if (reorgDetected && (legacyFunding || legacySpend)) {
-			const [txStatus, outspend] = await Promise.all([
-				fetchTxStatus(explorerApi, u.txid),
-				fetchOutspend(explorerApi, u.txid, u.outputIndex),
-			]);
-			if (txStatus && outspend) {
-				await rollBackSilentPaymentUtxo(u.txid, u.outputIndex, {
-					fundingConfirmed: txStatus.confirmed,
-					spent: outspend.spent,
-				});
-			}
 		}
 	}
 }
@@ -1401,8 +1362,6 @@ export async function syncFromExplorer(options: {
 			// 2. Resolve start height and check for reorgs
 			let startHeight: number;
 			let reorgDetected = false;
-			/** After a reorg: the block time from which records without heights are asked about. */
-			let legacyReorgSince: number | undefined;
 			let effectiveBirthday = storedBirthday ?? undefined;
 
 			if (forceFromHeight !== undefined && Number.isFinite(forceFromHeight)) {
@@ -1476,14 +1435,6 @@ export async function syncFromExplorer(options: {
 						return { scannedUtxos: newlyDetectedUtxos, status: "superseded", tipHeight };
 					}
 					ctx.unspent = await loadWatchedOutpoints(chain.id, silentPaymentAddress);
-					try {
-						const [first] = await fetchBlockHeaders(explorerApi, fromHeight, fromHeight);
-						if (typeof first?.timestamp === "number") {
-							legacyReorgSince = first.timestamp - REORG_LEGACY_TIME_MARGIN_SECONDS;
-						}
-					} catch {
-						// Without the time every record lacking a height is asked about.
-					}
 				} else {
 					startHeight = savedCursor.height + 1;
 				}
@@ -1850,10 +1801,7 @@ export async function syncFromExplorer(options: {
 			await reconcileTrackedUtxos({
 				caughtUp,
 				chainId: chain.id,
-				explorerApi,
 				fullyScanned: caughtUp && !backfill,
-				legacyReorgSince,
-				reorgDetected,
 				silentPaymentAddress,
 			});
 
