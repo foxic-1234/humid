@@ -113,6 +113,12 @@ export const FALLBACK_EXPLORER_REQUESTS_PER_SECOND = 10;
  */
 const HOURLY_REQUEST_BUDGETS = new Map<string, number>([["https://blockstream.info", 300]]);
 const BUDGET_WINDOW_MS = 60 * 60_000;
+/**
+ * The share of a server's hourly budget a search of older blocks may use. The rest is kept for the
+ * new blocks: a search with no other server to read from would spend the hour in half a minute,
+ * and no payment would show until the next one.
+ */
+const HISTORY_BUDGET_SHARE = 0.5;
 /** Requests are counted by the minute they started in. */
 const BUDGET_BUCKET_MS = 60_000;
 /**
@@ -381,6 +387,20 @@ export function explorerBudgetSpent(api: string): boolean {
 	return Date.now() < limiterFor(api).budgetSpentUntil;
 }
 
+/**
+ * Whether a search of older blocks may still read from `api`'s server this hour: always on a
+ * server without an hourly budget, else while `HISTORY_BUDGET_SHARE` of the budget is unused.
+ */
+export function explorerBudgetLeftForHistory(api: string): boolean {
+	const limiter = limiterFor(api);
+	if (limiter.budget === undefined) return true;
+	const now = Date.now();
+	return (
+		now >= limiter.budgetSpentUntil &&
+		budgetUsed(limiter, now) < limiter.budget * HISTORY_BUDGET_SHARE
+	);
+}
+
 /** Requests started since the service worker began, on every explorer. */
 export function explorerRequestsStarted(): number {
 	return requestsStarted;
@@ -460,7 +480,9 @@ function failed(limiter: ExplorerLimiter): void {
 /**
  * Ask each fallback passed over for failing, whose probe is due, for the chain tip: one that
  * answers is used again at once. A scan awaits this before it picks its explorers; the probe is
- * outside the scan's requests, so a server still down costs the scan nothing but the wait.
+ * outside the scan's requests, so a server still down costs the scan nothing but the wait. While
+ * no explorer of `apis` is usable the scan stands still, and the probe goes out a minute after the
+ * last one however long its wait has grown.
  */
 export async function probeUnreachableExplorers(apis: string[]): Promise<void> {
 	if (!limitersRestoredDone) await restoreLimiters();
@@ -468,9 +490,15 @@ export async function probeUnreachableExplorers(apis: string[]): Promise<void> {
 		apis.map(async (api) => {
 			const limiter = limiterFor(api);
 			const now = Date.now();
-			if (limiter.probeAfter === 0 || now < limiter.probeAfter || now >= limiter.avoidUntil) {
-				return;
-			}
+			if (limiter.probeAfter === 0 || now >= limiter.avoidUntil) return;
+			const standsStill = !apis.some((other) => limiterFor(other).avoidUntil <= now);
+			const due = standsStill
+				? Math.min(
+						limiter.probeAfter,
+						limiter.probeAfter - limiter.probeInterval + FALLBACK_PROBE_INTERVAL_MS,
+					)
+				: limiter.probeAfter;
+			if (now < due) return;
 			// Before the answer: another run starting meanwhile sends no second probe.
 			limiter.probeAfter = now + limiter.probeInterval;
 			let answered = false;

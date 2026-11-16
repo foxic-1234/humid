@@ -5,6 +5,7 @@ import { LIQUID_TESTNET_CHAIN_ID } from "../domain/LiquidChain";
 import {
 	buildExplorerApis,
 	describeExplorerError,
+	explorerBudgetLeftForHistory,
 	explorerBudgetSpent,
 	explorerRateForTesting,
 	FALLBACK_EXPLORER_REQUESTS_PER_SECOND,
@@ -315,6 +316,29 @@ describe("a fallback explorer that failed", () => {
 		expect(describeExplorerError(new Error("Bad block"), "failed", apis)).toBe("Bad block");
 	});
 
+	it("is probed every minute while the scan has no other explorer to read from", async () => {
+		resetExplorerLimiterForTesting({ hourlyBudget: 2, requestsPerSecond: Infinity });
+		await failOnce();
+		// Two probes unanswered: the wait is four minutes by now.
+		later(MINUTE + 1);
+		await probeUnreachableExplorers(apis);
+		later(2 * MINUTE + 1);
+		await probeUnreachableExplorers(apis);
+		probes = 0;
+		later(MINUTE + 1);
+		await probeUnreachableExplorers(apis);
+		expect(probes).toBe(0);
+
+		await fetchFromExplorer(`${primary}/blocks/tip/height`);
+		await fetchFromExplorer(`${primary}/blocks/tip/height`);
+		expect(explorerBudgetSpent(primary)).toBe(true);
+		answer = 200;
+		await probeUnreachableExplorers(apis);
+
+		expect(probes).toBe(1);
+		expect(pickExplorerApi(apis)).toBe(fallback);
+	});
+
 	it("is not gone back to when the main explorer's hour is spent", async () => {
 		resetExplorerLimiterForTesting({ hourlyBudget: 2, requestsPerSecond: Infinity });
 		const timeout = Object.assign(new Error("aborted"), { name: "AbortError" });
@@ -414,6 +438,21 @@ describe("hourly request budget", () => {
 		later(3 * 60_000);
 		expect(explorerBudgetSpent(budgeted)).toBe(false);
 		expect(pickExplorerApi(apis)).toBe(budgeted);
+	});
+
+	it("leaves half of a server's hour to the new blocks when older ones are searched", async () => {
+		await spend(budgeted, 4);
+		expect(explorerBudgetLeftForHistory(budgeted)).toBe(true);
+
+		await spend(budgeted, 1);
+		expect(explorerBudgetLeftForHistory(budgeted)).toBe(false);
+		// The new blocks still have the other half.
+		expect(explorerBudgetSpent(budgeted)).toBe(false);
+		expect(pickExplorerApi(apis)).toBe(budgeted);
+
+		// A server without a cap has no share to keep.
+		await spend(fallback, 20);
+		expect(explorerBudgetLeftForHistory(fallback)).toBe(true);
 	});
 
 	it("sets no budget on a server that has no hourly cap", async () => {

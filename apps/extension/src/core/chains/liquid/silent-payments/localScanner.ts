@@ -20,6 +20,7 @@ import {
 	describeExplorerError,
 	fallbackExplorerUnreachable,
 	ExplorerBudgetError,
+	explorerBudgetLeftForHistory,
 	explorerBudgetSpent,
 	explorerRequestsStarted,
 	fetchOutspend,
@@ -1589,6 +1590,20 @@ export async function syncFromExplorer(options: {
 			 * spent: the next run picks another explorer, or waits for this one.
 			 */
 			const mayTakeWindow = () => Date.now() < deadline && !explorerBudgetSpent(explorerApi);
+			// The search of older blocks leaves part of a capped server's hour to the new blocks, so
+			// payments keep showing while it waits; once its share is used the run reads from a
+			// server without a cap, if one answers.
+			if (backfill && !explorerBudgetLeftForHistory(explorerApi)) {
+				const other = usableExplorerApis(explorerApis).find(
+					(api) => api !== explorerApi && explorerBudgetLeftForHistory(api),
+				);
+				if (other) {
+					explorerApi = other;
+					ctx.explorerApis = [other, ...explorerApis.filter((api) => api !== other)];
+				}
+			}
+			const mayTakeHistoryWindow = () =>
+				mayTakeWindow() && explorerBudgetLeftForHistory(explorerApi);
 			// While a backfill runs, a window's spends are indexed before any of its blocks counts as
 			// scanned, so the cursor never gets ahead of the index.
 			const listWindow = async (headers: EsploraBlockHeader[]) => {
@@ -1714,7 +1729,7 @@ export async function syncFromExplorer(options: {
 			const backfillWindow = (stopHeight: number, top: number, budget: number) =>
 				fetchWindow(Math.max(stopHeight, top - Math.min(SCAN_WINDOW_BLOCKS, budget) + 1), top);
 			let nextBackfillWindow =
-				backfill && !scanHaltedDueToError && !superseded && blocksLeft > 0 && mayTakeWindow()
+				backfill && !scanHaltedDueToError && !superseded && blocksLeft > 0 && mayTakeHistoryWindow()
 					? backfillWindow(backfill.stopHeight, backfill.nextHeight, blocksLeft)
 					: undefined;
 			let rewinds = 0;
@@ -1756,7 +1771,7 @@ export async function syncFromExplorer(options: {
 						continue;
 					}
 					const budgetLeft = blocksLeft - headers.length;
-					if (low > backfill.stopHeight && budgetLeft > 0 && mayTakeWindow()) {
+					if (low > backfill.stopHeight && budgetLeft > 0 && mayTakeHistoryWindow()) {
 						nextBackfillWindow = backfillWindow(backfill.stopHeight, low - 1, budgetLeft);
 					}
 

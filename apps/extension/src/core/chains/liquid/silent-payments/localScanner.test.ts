@@ -23,6 +23,7 @@ import { resetExplorerLimiterForTesting } from "./explorer";
 import {
 	augmentPortfolioWithSilentPayments,
 	buildExplorerApis,
+	explorerBudgetSpent,
 	fetchFromExplorer,
 	getSilentPaymentBirthday,
 	getSilentPaymentBackfill,
@@ -845,6 +846,50 @@ describe("Autonomous Wallet Scanner (localScanner)", () => {
 			expect(byTxid.get(replaced)).toMatchObject({ spent: false });
 			expect(byTxid.get(replaced)!.spendUnverified).toBeUndefined();
 			expect(byTxid.get(kept)).toMatchObject({ spent: true, spentBlockHeight: 1985 });
+		});
+
+		describe("on an explorer with an hourly budget", () => {
+			const [primary, fallback] = buildExplorerApis(chain) as [string, string];
+			let fallbackUp: boolean;
+			let fallbackRequests: number;
+
+			beforeEach(async () => {
+				resetExplorerLimiterForTesting({ hourlyBudget: 60, requestsPerSecond: Infinity });
+				fallbackUp = false;
+				fallbackRequests = 0;
+				const explorer = withChain(() => undefined);
+				globalThis.fetch = (async (input: string) => {
+					if (input.startsWith(fallback)) {
+						fallbackRequests++;
+						if (!fallbackUp) throw new TypeError("fetch failed");
+					}
+					return explorer(input);
+				}) as unknown as typeof fetch;
+				await rescanFromExplorer({ birthdayHeight: 100, chain, silentPaymentAddress: address });
+			});
+
+			it("keeps part of the hour for new blocks when no other explorer answers", async () => {
+				for (let i = 0; i < 4; i++) await run(2000);
+
+				// The search stopped at its share: the new blocks can still be checked this hour.
+				expect(explorerBudgetSpent(primary)).toBe(false);
+				const backfill = await getSilentPaymentBackfill(chain.id, address);
+				expect(backfill!.nextHeight).toBeLessThan(2000);
+				expect(backfill!.nextHeight).toBeGreaterThan(100);
+				expect(getSilentPaymentLocalScanProgress(chain.id, address)?.state).not.toBe("error");
+			});
+
+			it("goes on through an explorer without a cap once its share is used", async () => {
+				fallbackUp = true;
+
+				let status = "";
+				for (let i = 0; i < 4 && status !== "synced"; i++) ({ status } = await run(2000));
+
+				expect(status).toBe("synced");
+				expect(fallbackRequests).toBeGreaterThan(0);
+				expect(explorerBudgetSpent(primary)).toBe(false);
+				expect(await getSilentPaymentBackfill(chain.id, address)).toBeNull();
+			});
 		});
 
 		it("asks the explorer for a backfill without a spent index", async () => {
