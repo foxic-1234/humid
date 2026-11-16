@@ -20,7 +20,7 @@ import {
 	describeExplorerError,
 	fallbackExplorerUnreachable,
 	ExplorerBudgetError,
-	explorerBudgetLeftForHistory,
+	explorerHistoryAllowance,
 	explorerBudgetSpent,
 	explorerRequestsStarted,
 	fetchOutspend,
@@ -32,6 +32,7 @@ import {
 	restoreExplorerLimiters,
 	sessionArea,
 	sustainedExplorerRequestRate,
+	uncappedExplorerApi,
 	usableExplorerApis,
 	resolveMissingPrevouts,
 } from "./explorer";
@@ -168,9 +169,11 @@ export type ExplorerScanResult = {
 	scannedUtxos: TrackedSilentPaymentUtxo[];
 	/**
 	 * `synced`: the cursor reached the tip. `partial`: the run's budget ended first. `halted`: a
-	 * block failed to scan. `superseded`: a rescan reset the cursor during the run.
+	 * block failed to scan. `superseded`: a rescan reset the cursor during the run. `waiting`: the
+	 * new blocks are checked, and the older ones wait for the explorer's next hour of requests:
+	 * another run now would find nothing to do.
 	 */
-	status: "synced" | "partial" | "halted" | "superseded";
+	status: "synced" | "partial" | "halted" | "superseded" | "waiting";
 	tipHeight: number;
 };
 
@@ -1590,20 +1593,6 @@ export async function syncFromExplorer(options: {
 			 * spent: the next run picks another explorer, or waits for this one.
 			 */
 			const mayTakeWindow = () => Date.now() < deadline && !explorerBudgetSpent(explorerApi);
-			// The search of older blocks leaves part of a capped server's hour to the new blocks, so
-			// payments keep showing while it waits; once its share is used the run reads from a
-			// server without a cap, if one answers.
-			if (backfill && !explorerBudgetLeftForHistory(explorerApi)) {
-				const other = usableExplorerApis(explorerApis).find(
-					(api) => api !== explorerApi && explorerBudgetLeftForHistory(api),
-				);
-				if (other) {
-					explorerApi = other;
-					ctx.explorerApis = [other, ...explorerApis.filter((api) => api !== other)];
-				}
-			}
-			const mayTakeHistoryWindow = () =>
-				mayTakeWindow() && explorerBudgetLeftForHistory(explorerApi);
 			// While a backfill runs, a window's spends are indexed before any of its blocks counts as
 			// scanned, so the cursor never gets ahead of the index.
 			const listWindow = async (headers: EsploraBlockHeader[]) => {
@@ -1728,9 +1717,24 @@ export async function syncFromExplorer(options: {
 			// while one is scanned, as going forward.
 			const backfillWindow = (stopHeight: number, top: number, budget: number) =>
 				fetchWindow(Math.max(stopHeight, top - Math.min(SCAN_WINDOW_BLOCKS, budget) + 1), top);
+			// Older blocks are read from a server without an hourly cap, if one answers: the capped
+			// server's hour would go in half a minute. Without one, the search takes only a share of
+			// that hour, in windows that fit it (a block costs up to two requests), so the new
+			// blocks are still checked while it waits.
+			if (backfill) {
+				const uncapped = uncappedExplorerApi(explorerApis);
+				if (uncapped && uncapped !== explorerApi) {
+					explorerApi = uncapped;
+					ctx.explorerApis = [uncapped, ...explorerApis.filter((api) => api !== uncapped)];
+				}
+			}
+			const historyBlocks = (blocks: number) =>
+				mayTakeWindow()
+					? Math.min(blocks, Math.floor(explorerHistoryAllowance(explorerApi) / 2))
+					: 0;
 			let nextBackfillWindow =
-				backfill && !scanHaltedDueToError && !superseded && blocksLeft > 0 && mayTakeHistoryWindow()
-					? backfillWindow(backfill.stopHeight, backfill.nextHeight, blocksLeft)
+				backfill && !scanHaltedDueToError && !superseded && historyBlocks(blocksLeft) > 0
+					? backfillWindow(backfill.stopHeight, backfill.nextHeight, historyBlocks(blocksLeft))
 					: undefined;
 			let rewinds = 0;
 			while (nextBackfillWindow && backfill) {
@@ -1771,8 +1775,12 @@ export async function syncFromExplorer(options: {
 						continue;
 					}
 					const budgetLeft = blocksLeft - headers.length;
-					if (low > backfill.stopHeight && budgetLeft > 0 && mayTakeHistoryWindow()) {
-						nextBackfillWindow = backfillWindow(backfill.stopHeight, low - 1, budgetLeft);
+					if (low > backfill.stopHeight && historyBlocks(budgetLeft) > 0) {
+						nextBackfillWindow = backfillWindow(
+							backfill.stopHeight,
+							low - 1,
+							historyBlocks(budgetLeft),
+						);
 					}
 
 					const found: TrackedSilentPaymentUtxo[] = [];
@@ -1839,9 +1847,11 @@ export async function syncFromExplorer(options: {
 			const done = forwardCaughtUp && !backfill;
 			updateProgress(done ? "synced" : "backfilling");
 
+			const historyWaits =
+				forwardCaughtUp && backfill !== null && explorerHistoryAllowance(explorerApi) < 2;
 			return {
 				scannedUtxos: newlyDetectedUtxos,
-				status: done ? "synced" : "partial",
+				status: done ? "synced" : historyWaits ? "waiting" : "partial",
 				tipHeight,
 			};
 		} finally {
@@ -1956,7 +1966,8 @@ export function startExplorerCatchUp(options: {
 					console.warn("[sp-local-scanner] Catch-up run failed:", err);
 					status = "halted";
 				}
-				if (status === "synced") return;
+				// Waiting for the explorer's next hour: the next refresh takes the scan up again.
+				if (status === "synced" || status === "waiting") return;
 				if (status !== "halted") {
 					failures = 0;
 					continue;

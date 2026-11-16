@@ -5,7 +5,7 @@ import { LIQUID_TESTNET_CHAIN_ID } from "../domain/LiquidChain";
 import {
 	buildExplorerApis,
 	describeExplorerError,
-	explorerBudgetLeftForHistory,
+	explorerHistoryAllowance,
 	explorerBudgetSpent,
 	explorerRateForTesting,
 	FALLBACK_EXPLORER_REQUESTS_PER_SECOND,
@@ -21,6 +21,7 @@ import {
 	resetExplorerLimiterForTesting,
 	restoreExplorerLimiters,
 	sustainedExplorerRequestRate,
+	uncappedExplorerApi,
 } from "./explorer";
 
 describe("explorer request limiter", () => {
@@ -281,12 +282,19 @@ describe("a fallback explorer that failed", () => {
 		probes = 0;
 		answer = 200;
 
-		later(2 * MINUTE);
+		later(MINUTE / 2);
 		await probeUnreachableExplorers(apis);
 
 		expect(probes).toBe(0);
 		expect(pickExplorerApi(apis)).toBe(primary);
 		expect(fallbackExplorerUnreachable(apis)).toBe(false);
+		// Still where older blocks are read from: its requests wait the pause out.
+		expect(uncappedExplorerApi(apis)).toBe(fallback);
+		expect(sustainedExplorerRequestRate(apis)).toBeGreaterThan(1);
+
+		// The pause over, it is used again: a fallback has no hour to wait out.
+		later(MINUTE);
+		expect(pickExplorerApi(apis)).toBe(fallback);
 	});
 
 	it("does not take a page that is not the chain tip for an answer", async () => {
@@ -441,18 +449,18 @@ describe("hourly request budget", () => {
 	});
 
 	it("leaves half of a server's hour to the new blocks when older ones are searched", async () => {
-		await spend(budgeted, 4);
-		expect(explorerBudgetLeftForHistory(budgeted)).toBe(true);
+		await spend(budgeted, 3);
+		expect(explorerHistoryAllowance(budgeted)).toBe(2);
 
-		await spend(budgeted, 1);
-		expect(explorerBudgetLeftForHistory(budgeted)).toBe(false);
+		await spend(budgeted, 3);
+		expect(explorerHistoryAllowance(budgeted)).toBe(0);
 		// The new blocks still have the other half.
 		expect(explorerBudgetSpent(budgeted)).toBe(false);
 		expect(pickExplorerApi(apis)).toBe(budgeted);
 
 		// A server without a cap has no share to keep.
 		await spend(fallback, 20);
-		expect(explorerBudgetLeftForHistory(fallback)).toBe(true);
+		expect(explorerHistoryAllowance(fallback)).toBe(Infinity);
 	});
 
 	it("sets no budget on a server that has no hourly cap", async () => {
@@ -478,15 +486,18 @@ describe("hourly request budget", () => {
 	it("counts what the explorers keep up for hours, not a burst", async () => {
 		// The fallback at this test's fixed rate, the budgeted server at ten requests an hour.
 		resetExplorerLimiterForTesting({ hourlyBudget: 10, requestsPerSecond: 2 });
-		expect(sustainedExplorerRequestRate(apis)).toBeCloseTo(2 + 10 / 3600, 6);
+		// Older blocks are read from the server without a cap while it answers.
+		expect(sustainedExplorerRequestRate(apis)).toBeCloseTo(2, 6);
+		expect(uncappedExplorerApi(apis)).toBe(fallback);
 
 		globalThis.fetch = (async () => {
 			throw new TypeError("fetch failed");
 		}) as unknown as typeof fetch;
 		await expect(fetchFromExplorer(`${fallback}/blocks/tip/height`)).rejects.toThrow();
 
-		// A fallback being passed over adds nothing.
-		expect(sustainedExplorerRequestRate(apis)).toBeCloseTo(10 / 3600, 6);
+		// Without it, the search's share of the budgeted server's hour.
+		expect(sustainedExplorerRequestRate(apis)).toBeCloseTo(5 / 3600, 6);
+		expect(uncappedExplorerApi(apis)).toBeUndefined();
 	});
 
 	it("keeps the hour's count across service worker restarts", async () => {

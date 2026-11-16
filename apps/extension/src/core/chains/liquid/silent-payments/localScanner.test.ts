@@ -869,9 +869,11 @@ describe("Autonomous Wallet Scanner (localScanner)", () => {
 			});
 
 			it("keeps part of the hour for new blocks when no other explorer answers", async () => {
-				for (let i = 0; i < 4; i++) await run(2000);
+				let status = "";
+				for (let i = 0; i < 4; i++) ({ status } = await run(2000));
 
 				// The search stopped at its share: the new blocks can still be checked this hour.
+				expect(status).toBe("waiting");
 				expect(explorerBudgetSpent(primary)).toBe(false);
 				const backfill = await getSilentPaymentBackfill(chain.id, address);
 				expect(backfill!.nextHeight).toBeLessThan(2000);
@@ -879,7 +881,20 @@ describe("Autonomous Wallet Scanner (localScanner)", () => {
 				expect(getSilentPaymentLocalScanProgress(chain.id, address)?.state).not.toBe("error");
 			});
 
-			it("goes on through an explorer without a cap once its share is used", async () => {
+			it("does not run again and again while the search waits for the next hour", async () => {
+				// Each idle run would cost the requests that find the tip, until the hour is gone.
+				await startExplorerCatchUp({
+					chain,
+					recipientKeys: keys,
+					retryDelayMs: 0,
+					silentPaymentAddress: address,
+				});
+
+				expect(explorerBudgetSpent(primary)).toBe(false);
+				expect(await getSilentPaymentBackfill(chain.id, address)).not.toBeNull();
+			});
+
+			it("reads older blocks from an explorer without a cap while one answers", async () => {
 				fallbackUp = true;
 
 				let status = "";

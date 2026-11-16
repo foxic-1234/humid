@@ -75,7 +75,7 @@ export async function augmentPortfolioWithSilentPayments(
 		clearTimeout(timer);
 		// A backlog longer than one run, a run still going, or a failed run keeps going in the
 		// background (a failure after a pause); its finds show up on the next refresh.
-		if (status !== "synced") {
+		if (status !== "synced" && status !== "waiting") {
 			void startExplorerCatchUp({ chain, recipientKeys, restoredWallet, silentPaymentAddress });
 		}
 	}

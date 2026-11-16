@@ -388,17 +388,24 @@ export function explorerBudgetSpent(api: string): boolean {
 }
 
 /**
- * Whether a search of older blocks may still read from `api`'s server this hour: always on a
- * server without an hourly budget, else while `HISTORY_BUDGET_SHARE` of the budget is unused.
+ * Requests a search of older blocks may still send to `api`'s server this hour: no end of them on
+ * a server without an hourly budget, else what is left of `HISTORY_BUDGET_SHARE` of the budget.
  */
-export function explorerBudgetLeftForHistory(api: string): boolean {
+export function explorerHistoryAllowance(api: string): number {
 	const limiter = limiterFor(api);
-	if (limiter.budget === undefined) return true;
+	if (limiter.budget === undefined) return Infinity;
 	const now = Date.now();
-	return (
-		now >= limiter.budgetSpentUntil &&
-		budgetUsed(limiter, now) < limiter.budget * HISTORY_BUDGET_SHARE
-	);
+	if (now < limiter.budgetSpentUntil) return 0;
+	return Math.max(0, Math.floor(limiter.budget * HISTORY_BUDGET_SHARE - budgetUsed(limiter, now)));
+}
+
+/**
+ * The first of `apis` on a server without an hourly budget that answers, which is where a search
+ * of older blocks reads from. One pausing after a 429 counts: its requests wait the pause out.
+ */
+export function uncappedExplorerApi(apis: string[]): string | undefined {
+	const now = Date.now();
+	return apis.find((api) => limiterFor(api).budget === undefined && !awaitsProbe(api, now));
 }
 
 /** Requests started since the service worker began, on every explorer. */
@@ -407,19 +414,24 @@ export function explorerRequestsStarted(): number {
 }
 
 /**
- * Requests a second the explorers can keep answering for hours: a server with an hourly budget
- * gives that budget, another one its rate ceiling unless it is being passed over. A burst on a
- * budgeted server runs a hundred times faster, for seconds.
+ * Requests a second a search of older blocks can count on for hours: the rate ceilings of the
+ * servers without an hourly budget that answer (a pause after a 429 passes in seconds); with none
+ * of them, the search's share of the budgets. A burst on a budgeted server runs a hundred times
+ * faster, for seconds.
  */
 export function sustainedExplorerRequestRate(apis: string[]): number {
 	const now = Date.now();
-	let rate = 0;
+	let uncapped = 0;
+	let capped = 0;
 	for (const origin of new Set(apis.map((api) => new URL(api).origin))) {
 		const limiter = limiterFor(origin);
-		if (limiter.budget !== undefined) rate += limiter.budget / (BUDGET_WINDOW_MS / 1000);
-		else if (limiter.avoidUntil <= now) rate += limiter.ceiling;
+		if (limiter.budget !== undefined) {
+			capped += (limiter.budget * HISTORY_BUDGET_SHARE) / (BUDGET_WINDOW_MS / 1000);
+		} else if (!awaitsProbe(origin, now)) {
+			uncapped += limiter.ceiling;
+		}
 	}
-	return rate;
+	return uncapped > 0 ? uncapped : capped;
 }
 
 /** Test-only: the current request rate of the server `url` is on. */
@@ -592,7 +604,13 @@ export async function fetchFromExplorer(
 					: Math.min(1000 * 2 ** (limiter.consecutiveRateLimits - 1), MAX_RATE_LIMIT_COOLDOWN_MS)) +
 				jitter();
 			limiter.cooldownUntil = Math.max(limiter.cooldownUntil, Date.now() + pause);
-			limiter.avoidUntil = Date.now() + Math.max(pause, RATE_LIMITED_AVOID_MS);
+			// A fallback has no hourly cap behind its 429: it is back once the pause is over, and
+			// passing it over for minutes would leave a long scan to the capped server.
+			limiter.avoidUntil =
+				Date.now() +
+				(FALLBACK_EXPLORER_ORIGINS.has(limiter.origin)
+					? pause
+					: Math.max(pause, RATE_LIMITED_AVOID_MS));
 			// It answers: this pause is the server's own, which no probe lifts.
 			limiter.probeAfter = 0;
 			persistLimiter(limiter);
