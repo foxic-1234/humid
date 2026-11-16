@@ -315,6 +315,22 @@ describe("a fallback explorer that failed", () => {
 		expect(describeExplorerError(new Error("Bad block"), "failed", apis)).toBe("Bad block");
 	});
 
+	it("is not gone back to when the main explorer's hour is spent", async () => {
+		resetExplorerLimiterForTesting({ hourlyBudget: 2, requestsPerSecond: Infinity });
+		const timeout = Object.assign(new Error("aborted"), { name: "AbortError" });
+		await failOnce();
+		await fetchFromExplorer(`${primary}/blocks/tip/height`);
+		await fetchFromExplorer(`${primary}/blocks/tip/height`);
+		expect(explorerBudgetSpent(primary)).toBe(true);
+
+		// Both are passed over: the one that answers says its hour is spent at once, the other
+		// would cost a timeout a request.
+		expect(pickExplorerApi(apis)).toBe(primary);
+		expect(describeExplorerError(timeout, "failed", apis)).toBe(
+			"A backup block explorer is not answering and the main one's hourly request limit is reached; scanning resumes when the limit resets.",
+		);
+	});
+
 	describe("across service worker restarts", () => {
 		const scope = globalThis as { chrome?: unknown };
 

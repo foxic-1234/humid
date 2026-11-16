@@ -498,14 +498,17 @@ export async function probeUnreachableExplorers(apis: string[]): Promise<void> {
 	);
 }
 
+/** Whether `api`'s server is passed over for failing and waits for a probe to bring it back. */
+function awaitsProbe(api: string, now: number): boolean {
+	const origin = new URL(api).origin;
+	const state = explorerLimiters.get(origin) ?? persistedLimiters[origin];
+	return state !== undefined && Number(state.probeAfter) > 0 && Number(state.avoidUntil) > now;
+}
+
 /** Whether a fallback of `apis` is passed over for failing: a long scan is then far slower. */
 export function fallbackExplorerUnreachable(apis: string[]): boolean {
 	const now = Date.now();
-	return apis.some((api) => {
-		const origin = new URL(api).origin;
-		const state = explorerLimiters.get(origin) ?? persistedLimiters[origin];
-		return state !== undefined && Number(state.probeAfter) > 0 && Number(state.avoidUntil) > now;
-	});
+	return apis.some((api) => awaitsProbe(api, now));
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -613,6 +616,8 @@ export function pickExplorerApi(apis: string[]): string {
 /**
  * Every API whose server has not answered 429 (or failed) in the last minutes, in the given order
  * (the chain's own explorer first, then fallbacks); if all have, the one passed over the shortest.
+ * A fallback that does not answer is not that one while another server is left: a server whose
+ * hour is spent says so at once, the fallback costs a timeout a request.
  */
 export function usableExplorerApis(apis: string[]): string[] {
 	const now = Date.now();
@@ -624,9 +629,13 @@ export function usableExplorerApis(apis: string[]): string[] {
 		);
 	};
 	const usable = apis.filter((api) => avoidedUntil(api) <= now);
-	return usable.length > 0
-		? usable
-		: [apis.reduce((best, api) => (avoidedUntil(api) < avoidedUntil(best) ? api : best))];
+	if (usable.length > 0) return usable;
+	const answering = apis.filter((api) => !awaitsProbe(api, now));
+	return [
+		(answering.length > 0 ? answering : apis).reduce((best, api) =>
+			avoidedUntil(api) < avoidedUntil(best) ? api : best,
+		),
+	];
 }
 
 export async function fetchWithRetryAndBackoff(
@@ -752,7 +761,11 @@ export function describeExplorerError(error: unknown, fallback: string, apis?: s
 	const timedOut =
 		error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
 	if ((timedOut || error instanceof TypeError) && apis && fallbackExplorerUnreachable(apis)) {
-		return "A backup block explorer is not answering; scanning continues through the main one, more slowly.";
+		const now = Date.now();
+		// Without the fallback the scan lives on the main explorer's hourly allowance.
+		return apis.some((api) => !awaitsProbe(api, now) && !explorerBudgetSpent(api))
+			? "A backup block explorer is not answering; scanning continues through the main one, more slowly."
+			: "A backup block explorer is not answering and the main one's hourly request limit is reached; scanning resumes when the limit resets.";
 	}
 	if (timedOut) {
 		return "The block explorer did not answer in time; scanning resumes shortly.";
